@@ -1111,6 +1111,7 @@ async def task_lbmqtt_to_dreame(
                                 )
                         except Exception as e:
                             LOGERR(f"[{did}] Command '{command_name}' error: {e}")
+                            continue
                         result_payload = json.dumps({
                             "command":    command_name,
                             "result":     result_str,
@@ -1293,15 +1294,14 @@ async def _async_main() -> None:
                 except Exception as e:
                     LOGWARN(f"[{did}] Station props error: {e}")
 
-            # Start Dreame cloud MQTT
+            # Start Dreame cloud MQTT (only if device has a bind_domain)
             if bind:
                 dc = DreameMqttClient(bind, did, cfg["uid"], cfg["access_token"], queue, loop)
                 dc.start()
                 dreame_clients.append(dc)
-
-            tasks_coro.append(task_dreame_to_lbmqtt(
-                device, queue, broker, base_topic, session, brand, cfg, mower_settings
-            ))
+                tasks_coro.append(task_dreame_to_lbmqtt(
+                    device, queue, broker, base_topic, session, brand, cfg, mower_settings
+                ))
             tasks_coro.append(task_lbmqtt_to_dreame(
                 device, broker, base_topic, session, brand, cfg, pre_array_ref
             ))
