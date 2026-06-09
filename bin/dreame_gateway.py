@@ -247,6 +247,8 @@ def _load_json(path: Path) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
+    except FileNotFoundError:
+        return {}
     except Exception as e:
         LOGERR(f"Cannot read {path}: {e}")
         return {}
@@ -312,6 +314,8 @@ def get_mqtt_broker_config(general: dict) -> dict:
         tls        = True
         tls_verify = _is_enabled(mqtt.get("TlsExternalValidatecert", "false"))
         tls_cafile = None
+        if mqtt.get("TlsExternalPort"):
+            port = int(mqtt.get("TlsExternalPort"))
     return {
         "host": host, "port": port,
         "username": username, "password": password,

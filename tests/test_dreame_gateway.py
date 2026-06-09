@@ -143,6 +143,17 @@ def test_load_plugin_config_defaults(tmp_path):
     finally:
         dreame_gateway.PLUGIN_CFG = orig
 
+def test_load_plugin_config_no_file(tmp_path):
+    # Non-existent file should return defaults without error
+    orig = dreame_gateway.PLUGIN_CFG
+    dreame_gateway.PLUGIN_CFG = tmp_path / "nonexistent.json"
+    try:
+        cfg = load_plugin_config()
+        assert cfg["cloud_service"] == "dreame"
+        assert cfg["devices"] == []
+    finally:
+        dreame_gateway.PLUGIN_CFG = orig
+
 def test_get_mqtt_broker_config_defaults():
     general = {"Mqtt": {"Brokerhost": "192.168.1.10", "Brokerport": "1883"}}
     broker = get_mqtt_broker_config(general)
@@ -163,3 +174,17 @@ def test_get_mqtt_broker_config_tls():
     assert broker["tls"] is True
     assert broker["port"] == 8883
     assert broker["tls_verify"] is False
+
+def test_get_mqtt_broker_config_external_tls():
+    general = {"Mqtt": {
+        "Brokerhost": "external.broker.com",
+        "Brokerport": "1883",
+        "Uselocalbroker": "false",
+        "TlsExternalEnabled": "true",
+        "TlsExternalPort": "8884",
+        "TlsExternalValidatecert": "true",
+    }}
+    broker = get_mqtt_broker_config(general)
+    assert broker["tls"] is True
+    assert broker["port"] == 8884
+    assert broker["tls_verify"] is True
