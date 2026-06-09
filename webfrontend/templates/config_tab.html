@@ -3,14 +3,14 @@
 </TMPL_IF>
 
 <div class="lb-section-title">Cloud-Konfiguration</div>
-<form method="post">
+<form method="post" onsubmit="return true;">
 <input type="hidden" name="form"   value="config">
 <input type="hidden" name="action" value="save_config">
 
 <div class="lb-form-row">
-  <div class="lb-form-label">Cloud-Dienst</div>
+  <label class="lb-form-label" for="cloud_service">Cloud-Dienst</label>
   <div class="lb-form-field">
-    <select name="cloud_service" class="lb-input">
+    <select class="lb-select" name="cloud_service" id="cloud_service">
       <option value="dreame" <TMPL_IF IS_DREAME>selected</TMPL_IF>>Dreame</option>
       <option value="mova"   <TMPL_IF IS_MOVA>selected</TMPL_IF>>MOVA</option>
     </select>
@@ -18,40 +18,38 @@
 </div>
 
 <div class="lb-form-row">
-  <div class="lb-form-label">E-Mail / Benutzername</div>
+  <label class="lb-form-label" for="username">E-Mail / Benutzername</label>
   <div class="lb-form-field">
-    <input type="email" name="username" class="lb-input" value="<TMPL_VAR USERNAME>">
+    <input class="lb-input" type="email" name="username" id="username" value="<TMPL_VAR USERNAME>">
   </div>
 </div>
 
 <div class="lb-form-row">
-  <div class="lb-form-label">Passwort</div>
+  <label class="lb-form-label" for="password">Passwort</label>
   <div class="lb-form-field">
-    <input type="password" name="password" class="lb-input" placeholder="Leer lassen wenn bereits eingeloggt">
+    <input class="lb-input" type="password" name="password" id="password">
   </div>
-  <div class="lb-form-help hint">Das Passwort wird zum Einloggen in die Dreame/MOVA Cloud verwendet.</div>
 </div>
+<div class="lb-form-help hint">Das Passwort wird einmalig für den Login in die Dreame/MOVA Cloud verwendet. Leer lassen, wenn bereits eingeloggt.</div>
 
 <div class="lb-section-title" style="margin-top:2rem;">MQTT</div>
 
 <div class="lb-form-row">
-  <div class="lb-form-label">Base-Topic</div>
+  <label class="lb-form-label" for="base_topic">Base-Topic</label>
   <div class="lb-form-field">
-    <input type="text" name="base_topic" class="lb-input" value="<TMPL_VAR BASE_TOPIC>" placeholder="dreame">
-  </div>
-  <div class="lb-form-help hint">Alle MQTT-Topics beginnen mit diesem Prefix, z.B. <code>dreame/&lt;did&gt;/state</code></div>
-</div>
-
-<div class="lb-form-row">
-  <div class="lb-form-label">Statistik-Intervall (min)</div>
-  <div class="lb-form-field">
-    <input type="number" name="polling_interval_min" class="lb-input" value="<TMPL_VAR POLLING_INTERVAL_MIN>" min="5" max="1440" style="width:80px">
+    <input class="lb-input" type="text" name="base_topic" id="base_topic" value="<TMPL_VAR BASE_TOPIC>" placeholder="dreame">
   </div>
 </div>
+<div class="lb-form-help hint">Alle MQTT-Topics beginnen mit diesem Prefix, z.B. <code>dreame/&lt;did&gt;/state</code></div>
 
 <div class="lb-form-row">
+  <label class="lb-form-label" for="polling_interval_min">Statistik-Intervall (min)</label>
   <div class="lb-form-field">
-    <button type="submit" class="lb-btn lb-btn-primary">Speichern</button>
+    <input class="lb-input" type="number" name="polling_interval_min" id="polling_interval_min" value="<TMPL_VAR POLLING_INTERVAL_MIN>" min="5" max="1440">
   </div>
+</div>
+
+<div style="margin-top:1.5rem;">
+  <button type="submit" class="lb-btn lb-btn-primary lb-btn-icon"><i class="pi pi-save"></i> Speichern</button>
 </div>
 </form>
