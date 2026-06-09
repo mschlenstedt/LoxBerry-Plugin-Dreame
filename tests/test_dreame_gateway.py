@@ -72,6 +72,9 @@ def test_parse_binary_state_1_list_input():
     assert result["battery"] == 85
     assert result["charging"] == 0
 
+def test_parse_binary_state_1_string_input():
+    assert parse_binary_state_1("not binary") == {}
+
 # ── _normalize_autoswitch ─────────────────────────────────────────────────────
 def test_normalize_autoswitch_dict():
     result = _normalize_autoswitch({"k": "LessColl", "v": 1})
@@ -98,6 +101,7 @@ def test_build_state_json_common_fields():
     assert state["online"] is True
     assert state["status"] == 1
     assert state["battery"] == 85
+    assert state["status_str"] == "Working"  # status=1 for mower
 
 def test_build_state_json_vacuum():
     device = {"did": "456", "model": "dreame.vacuum.r2228o", "name": "Sauger", "device_type": "vacuum", "online": False}

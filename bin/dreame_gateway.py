@@ -68,7 +68,9 @@ def _get_device_type(model: str) -> str:
 
 # ── Binär-Parser (Mähroboter siid=1 piid=1) ──────────────────────────────────
 def parse_binary_state_1(value) -> dict:
-    buf = bytes(value) if not isinstance(value, (bytes, bytearray)) else bytes(value)
+    if isinstance(value, str):
+        return {}
+    buf = bytes(value)
     if len(buf) < 19:
         return {}
     error_code    = int.from_bytes(buf[1:5], "little")
