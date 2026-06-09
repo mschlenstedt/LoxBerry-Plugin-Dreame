@@ -175,3 +175,182 @@ def build_station_json(props: dict) -> dict:
         "detergent":            props.get((25, 4), 0),
         "hot_water":            props.get((25, 5), 0),
     }
+
+
+# ── CLI-Args ──────────────────────────────────────────────────────────────────
+_ap = argparse.ArgumentParser(add_help=False)
+_ap.add_argument("--logfile",   default="")
+_ap.add_argument("--logdbkey",  default="")
+_ap.add_argument("--configdir", default="")
+_ap.add_argument("--lbsconfig", default="/opt/loxberry/config/system")
+_ap.add_argument("--loglevel",  type=int, default=6)
+_args, _ = _ap.parse_known_args()
+
+# ── Pfade ─────────────────────────────────────────────────────────────────────
+LBHOMEDIR    = os.environ.get("LBHOMEDIR", "/opt/loxberry")
+LBSCONFIG    = Path(_args.lbsconfig)
+CONFIGDIR    = Path(_args.configdir) if _args.configdir else Path(LBHOMEDIR) / "config/plugins/dreame"
+GENERAL_JSON = LBSCONFIG / "general.json"
+PLUGIN_CFG   = CONFIGDIR / "pluginconfig.json"
+PID_FILE     = Path("/dev/shm/dreame_gateway.pid")
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+_loglevel = _args.loglevel
+_logfile  = _args.logfile
+_logger = logging.getLogger("dreame_gateway")
+_logger.propagate = False
+_logger.setLevel(logging.DEBUG)
+_handler = (
+    logging.FileHandler(_logfile, mode="a", encoding="utf-8")
+    if _logfile else logging.StreamHandler(sys.stdout)
+)
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s.%(msecs)03d <%(levelname)s> %(message)s",
+    datefmt="%H:%M:%S"
+))
+_logger.addHandler(_handler)
+
+
+def _log(level: int, levelname: str, msg: str) -> None:
+    if level <= _loglevel:
+        record = logging.LogRecord(
+            name=_logger.name, level=logging.DEBUG,
+            pathname="", lineno=0, msg=msg, args=(), exc_info=None,
+        )
+        record.levelname = levelname
+        _handler.emit(record)
+
+
+def LOGSTART(msg: str) -> None: _log(5, "OK",    msg)
+def LOGERR(msg: str)   -> None: _log(3, "ERR",   msg)
+def LOGWARN(msg: str)  -> None: _log(4, "WARN",  msg)
+def LOGOK(msg: str)    -> None: _log(5, "OK",    msg)
+def LOGINF(msg: str)   -> None: _log(6, "INFO",  msg)
+def LOGDEB(msg: str)   -> None: _log(7, "DEBUG", msg)
+
+
+def _logend() -> None:
+    dbkey = _args.logdbkey
+    if not dbkey:
+        return
+    if not re.match(r'^[\w]+$', dbkey):
+        return
+    os.system(
+        f'perl -e \'use LoxBerry::Log; '
+        f'my $l = LoxBerry::Log->new(dbkey => "{dbkey}", append => 1); '
+        f'LOGEND "Gateway stopped."; exit;\''
+    )
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+def _load_json(path: Path) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        LOGERR(f"Cannot read {path}: {e}")
+        return {}
+
+
+def _save_json_atomic(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        tmp.replace(path)
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        LOGERR(f"Cannot write {path}: {e}")
+
+
+def load_plugin_config() -> dict:
+    cfg = _load_json(PLUGIN_CFG)
+    cfg.setdefault("cloud_service",        "dreame")
+    cfg.setdefault("username",             "")
+    cfg.setdefault("password_hash",        "")
+    cfg.setdefault("access_token",         "")
+    cfg.setdefault("refresh_token",        "")
+    cfg.setdefault("expires_at",           0)
+    cfg.setdefault("uid",                  "")
+    cfg.setdefault("base_topic",           "dreame")
+    cfg.setdefault("polling_interval_min", 30)
+    cfg.setdefault("devices",             [])
+    return cfg
+
+
+def save_plugin_config(cfg: dict) -> None:
+    _save_json_atomic(PLUGIN_CFG, cfg)
+
+
+def _is_enabled(val) -> bool:
+    return str(val).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _str_or_none(val) -> "str | None":
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s if s else None
+
+
+def get_mqtt_broker_config(general: dict) -> dict:
+    mqtt = general.get("Mqtt", {})
+    host     = mqtt.get("Brokerhost", "localhost")
+    port     = int(mqtt.get("Brokerport", 1883))
+    username = _str_or_none(mqtt.get("Brokeruser"))
+    password = _str_or_none(mqtt.get("Brokerpass"))
+    use_local = _is_enabled(mqtt.get("Uselocalbroker", "true"))
+    tls = False
+    tls_verify = False
+    tls_cafile = None
+    if use_local and _is_enabled(mqtt.get("Tlsenabled", "false")):
+        tls        = True
+        tls_verify = False
+        tls_cafile = "/etc/mosquitto/tls/ca.crt"
+        port       = int(mqtt.get("Tlsport", 8883))
+    elif not use_local and _is_enabled(mqtt.get("TlsExternalEnabled", "false")):
+        tls        = True
+        tls_verify = _is_enabled(mqtt.get("TlsExternalValidatecert", "false"))
+        tls_cafile = None
+    return {
+        "host": host, "port": port,
+        "username": username, "password": password,
+        "tls": tls, "tls_verify": tls_verify, "tls_cafile": tls_cafile,
+    }
+
+
+def _build_mqtt_kwargs(broker: dict) -> dict:
+    kwargs: dict = {"hostname": broker["host"], "port": broker["port"]}
+    if broker.get("username"):
+        kwargs["username"] = broker["username"]
+    if broker.get("password"):
+        kwargs["password"] = broker["password"]
+    if broker.get("tls"):
+        ctx = ssl.create_default_context()
+        if not broker.get("tls_verify"):
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        elif broker.get("tls_cafile") and os.path.isfile(broker["tls_cafile"]):
+            ctx.load_verify_locations(broker["tls_cafile"])
+        kwargs["tls_context"] = ctx
+    return kwargs
+
+
+# ── PID + Shutdown ────────────────────────────────────────────────────────────
+def write_pid() -> None:
+    try:
+        PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    except Exception as e:
+        LOGERR(f"Cannot write PID: {e}")
+
+
+def remove_pid() -> None:
+    PID_FILE.unlink(missing_ok=True)
+
+
+_shutdown_event: asyncio.Event = asyncio.Event()
+
+
+def _handle_sigterm(*_) -> None:
+    LOGINF("SIGTERM received — shutting down")
+    _shutdown_event.set()

@@ -119,3 +119,46 @@ def test_build_station_json_basic():
     assert station["dirty_water_tank"] == 1
     assert station["dirty_water_tank_str"] == "Not installed/Full"
     assert station["dust_bag"] == 0
+
+from dreame_gateway import load_plugin_config, get_mqtt_broker_config
+import dreame_gateway
+
+def test_load_plugin_config_defaults(tmp_path):
+    cfg_path = tmp_path / "pluginconfig.json"
+    cfg_path.write_text("{}", encoding="utf-8")
+    orig = dreame_gateway.PLUGIN_CFG
+    dreame_gateway.PLUGIN_CFG = cfg_path
+    try:
+        cfg = load_plugin_config()
+        assert cfg["cloud_service"] == "dreame"
+        assert cfg["base_topic"] == "dreame"
+        assert cfg["polling_interval_min"] == 30
+        assert cfg["devices"] == []
+        assert cfg["access_token"] == ""
+        assert cfg["refresh_token"] == ""
+        assert cfg["expires_at"] == 0
+        assert cfg["uid"] == ""
+        assert cfg["username"] == ""
+    finally:
+        dreame_gateway.PLUGIN_CFG = orig
+
+def test_get_mqtt_broker_config_defaults():
+    general = {"Mqtt": {"Brokerhost": "192.168.1.10", "Brokerport": "1883"}}
+    broker = get_mqtt_broker_config(general)
+    assert broker["host"] == "192.168.1.10"
+    assert broker["port"] == 1883
+    assert broker["tls"] is False
+    assert broker["username"] is None
+
+def test_get_mqtt_broker_config_tls():
+    general = {"Mqtt": {
+        "Brokerhost": "lb.local",
+        "Brokerport": "1883",
+        "Uselocalbroker": "true",
+        "Tlsenabled": "true",
+        "Tlsport": "8883",
+    }}
+    broker = get_mqtt_broker_config(general)
+    assert broker["tls"] is True
+    assert broker["port"] == 8883
+    assert broker["tls_verify"] is False
