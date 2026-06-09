@@ -15,6 +15,7 @@ import sys
 import time
 from pathlib import Path
 
+import aiohttp
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
@@ -361,9 +362,6 @@ def _handle_sigterm(*_) -> None:
 
 
 # ── Dreame Auth ───────────────────────────────────────────────────────────────
-import aiohttp
-
-
 def _build_dreame_headers(brand: dict, access_token: "str | None" = None) -> dict:
     """Build required HTTP headers for Dreame cloud API calls."""
     headers = {
