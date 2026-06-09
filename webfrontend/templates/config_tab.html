@@ -1,0 +1,57 @@
+<TMPL_IF SAVE_OK>
+<div class="lb-alert lb-alert-success"><TMPL_VAR SAVE_MSG></div>
+</TMPL_IF>
+
+<div class="lb-section-title">Cloud-Konfiguration</div>
+<form method="post">
+<input type="hidden" name="form"   value="config">
+<input type="hidden" name="action" value="save_config">
+
+<div class="lb-form-row">
+  <div class="lb-form-label">Cloud-Dienst</div>
+  <div class="lb-form-field">
+    <select name="cloud_service" class="lb-input">
+      <option value="dreame" <TMPL_IF IS_DREAME>selected</TMPL_IF>>Dreame</option>
+      <option value="mova"   <TMPL_IF IS_MOVA>selected</TMPL_IF>>MOVA</option>
+    </select>
+  </div>
+</div>
+
+<div class="lb-form-row">
+  <div class="lb-form-label">E-Mail / Benutzername</div>
+  <div class="lb-form-field">
+    <input type="email" name="username" class="lb-input" value="<TMPL_VAR USERNAME>">
+  </div>
+</div>
+
+<div class="lb-form-row">
+  <div class="lb-form-label">Passwort</div>
+  <div class="lb-form-field">
+    <input type="password" name="password" class="lb-input" placeholder="Leer lassen wenn bereits eingeloggt">
+  </div>
+  <div class="lb-form-help hint">Das Passwort wird zum Einloggen in die Dreame/MOVA Cloud verwendet.</div>
+</div>
+
+<div class="lb-section-title" style="margin-top:2rem;">MQTT</div>
+
+<div class="lb-form-row">
+  <div class="lb-form-label">Base-Topic</div>
+  <div class="lb-form-field">
+    <input type="text" name="base_topic" class="lb-input" value="<TMPL_VAR BASE_TOPIC>" placeholder="dreame">
+  </div>
+  <div class="lb-form-help hint">Alle MQTT-Topics beginnen mit diesem Prefix, z.B. <code>dreame/&lt;did&gt;/state</code></div>
+</div>
+
+<div class="lb-form-row">
+  <div class="lb-form-label">Statistik-Intervall (min)</div>
+  <div class="lb-form-field">
+    <input type="number" name="polling_interval_min" class="lb-input" value="<TMPL_VAR POLLING_INTERVAL_MIN>" min="5" max="1440" style="width:80px">
+  </div>
+</div>
+
+<div class="lb-form-row">
+  <div class="lb-form-field">
+    <button type="submit" class="lb-btn lb-btn-primary">Speichern</button>
+  </div>
+</div>
+</form>
