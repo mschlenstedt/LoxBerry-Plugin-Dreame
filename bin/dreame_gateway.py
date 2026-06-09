@@ -433,3 +433,225 @@ async def dreame_refresh_token(
         "expires_in":    int(body.get("expires_in", 3600)),
         "uid":           str(body.get("uid", "")),
     }
+
+
+# ── Dreame REST API ───────────────────────────────────────────────────────────
+_request_id = 1
+
+
+def _next_request_id() -> int:
+    global _request_id
+    _request_id = (_request_id % 99999) + 1
+    return _request_id
+
+
+def _parse_device_list(records: list) -> list:
+    devices = []
+    for r in records:
+        model = r.get("model", "")
+        devices.append({
+            "did":         r.get("did", ""),
+            "model":       model,
+            "name":        r.get("customName") or model,
+            "device_type": _get_device_type(model),
+            "bind_domain": r.get("bindDomain", ""),
+            "online":      bool(r.get("online", False)),
+        })
+    return devices
+
+
+async def get_device_list(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+) -> list:
+    """POST /dreame-user-iot/iotuserbind/device/listV2 → list of device dicts."""
+    url = f"https://{brand['domain']}/dreame-user-iot/iotuserbind/device/listV2"
+    headers = _build_dreame_headers(brand, access_token)
+    headers["content-type"] = "application/json"
+    body = {
+        "sharedStatus": 1, "current": 1, "size": 100,
+        "lang": "de", "timestamp": int(time.time() * 1000),
+    }
+    async with session.post(url, headers=headers, json=body, ssl=False) as resp:
+        resp.raise_for_status()
+        data = await resp.json(content_type=None)
+    records = data.get("result", {}).get("records", [])
+    return _parse_device_list(records)
+
+
+async def send_command(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    did: str,
+    method: str,
+    params,
+) -> dict:
+    """POST sendCommand to Dreame cloud → result dict."""
+    req_id = _next_request_id()
+    prefix = brand["iot_com_prefix"]
+    url = f"https://{brand['domain']}/dreame-iot-com-{prefix}/device/sendCommand"
+    headers = _build_dreame_headers(brand, access_token)
+    headers["content-type"] = "application/json"
+    body = {
+        "did": did, "id": req_id,
+        "data": {
+            "did": did, "id": req_id,
+            "method": method, "params": params, "from": "XXXXXX",
+        },
+    }
+    async with session.post(url, headers=headers, json=body, ssl=False) as resp:
+        resp.raise_for_status()
+        return await resp.json(content_type=None)
+
+
+async def send_mower_command(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    did: str,
+    payload: dict,
+) -> dict:
+    """Mower special channel: action siid=2 aiid=50 with arbitrary payload."""
+    params = {"did": did, "siid": 2, "aiid": 50, "in": [payload]}
+    return await send_command(session, brand, access_token, did, "action", params)
+
+
+async def get_properties(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    did: str,
+    siid_piid_list: list,
+) -> dict:
+    """get_properties for a list of (siid, piid) pairs → {(siid, piid): value}."""
+    params = [{"did": did, "siid": s, "piid": p} for s, p in siid_piid_list]
+    result = await send_command(session, brand, access_token, did, "get_properties", params)
+    out = {}
+    for item in result.get("result", {}).get("data", {}).get("result", []):
+        siid = item.get("siid")
+        piid = item.get("piid")
+        if siid is not None and piid is not None and "value" in item:
+            out[(siid, piid)] = item["value"]
+    return out
+
+
+async def load_mower_settings(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    did: str,
+) -> dict:
+    """Load mower CFG via getCFG action (siid=2 aiid=50) → settings dict."""
+    resp = await send_mower_command(session, brand, access_token, did, {"m": "g", "t": "CFG"})
+    raw = resp.get("result", {}).get("data", {}).get("result", {})
+    out: dict = {}
+
+    def _cfg_int(key: str) -> "int | None":
+        val = raw.get(key)
+        if val is None:
+            return None
+        return val.get("value", 0) if isinstance(val, dict) else int(val)
+
+    for cfg_key, out_key in [
+        ("WRP", "rain_protection"), ("FDP", "frost_protection"),
+        ("VOL", "volume"), ("CLS", "child_lock"),
+        ("STUN", "anti_theft"), ("AOP", "ai_obstacle"),
+        ("PROT", "grass_protection"), ("PATH", "path_display"),
+    ]:
+        v = _cfg_int(cfg_key)
+        if v is not None:
+            out[out_key] = v
+
+    # WRP also has time + sen fields
+    wrp = raw.get("WRP")
+    if isinstance(wrp, dict):
+        out["rain_delay_min"] = wrp.get("time", 0)
+
+    # PRE: cutting preferences array [zone, mow_mode, cutting_height_mm, ...]
+    pre = raw.get("PRE")
+    arr = pre.get("value", []) if isinstance(pre, dict) else (pre if isinstance(pre, list) else [])
+    out["_pre_array"] = arr
+    if len(arr) > 2:
+        out["cutting_height_mm"] = arr[2]
+    if len(arr) > 1:
+        out["mow_mode"] = arr[1]
+    if len(arr) > 9:
+        out["edge_mowing"] = arr[9]
+    if len(arr) > 8:
+        out["edge_detection"] = arr[8]
+    if len(arr) > 5:
+        out["direction_change"] = arr[5]
+
+    # CMS: consumables [blade_hours_raw, brush_hours_raw, robot_hours_raw]
+    cms = raw.get("CMS")
+    cms_val = cms.get("value", [0, 0, 0]) if isinstance(cms, dict) else (cms if isinstance(cms, list) else [0, 0, 0])
+    out["_cms_array"] = cms_val
+
+    return out
+
+
+async def load_mower_history(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    did: str,
+    uid: str,
+) -> list:
+    """Last 20 mowing sessions via /dreame-user-iot/mower/history/listV2."""
+    url = f"https://{brand['domain']}/dreame-user-iot/mower/history/listV2"
+    headers = _build_dreame_headers(brand, access_token)
+    headers["content-type"] = "application/json"
+    now = int(time.time())
+    body = {
+        "did": did, "uid": uid,
+        "time_start": now - 86400 * 90,
+        "time_end": now,
+        "limit": 20,
+        "from": 0,
+        "region": "eu",
+    }
+    async with session.post(url, headers=headers, json=body, ssl=False) as resp:
+        resp.raise_for_status()
+        data = await resp.json(content_type=None)
+    return data.get("result", {}).get("records", [])
+
+
+async def load_statistic(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    did: str,
+    device_type: str,
+) -> dict:
+    """Load consumable/statistic properties per device type."""
+    if device_type == "mower":
+        props = await get_properties(session, brand, access_token, did, [
+            (12, 2), (12, 3), (12, 4),
+        ])
+        return {
+            "total_mow_time_min": props.get((12, 2), 0),
+            "total_mow_count":    props.get((12, 3), 0),
+            "total_mow_area_m2":  props.get((12, 4), 0),
+        }
+    else:
+        props = await get_properties(session, brand, access_token, did, [
+            (12, 1), (12, 2), (12, 3), (12, 4),
+            (9, 1), (9, 2), (10, 1), (10, 2),
+            (11, 1), (11, 2), (16, 1), (30, 1),
+        ])
+        return {
+            "first_cleaning_date":     props.get((12, 1), 0),
+            "total_cleaning_time_min": props.get((12, 2), 0),
+            "cleaning_count":          props.get((12, 3), 0),
+            "total_cleaned_area_m2":   props.get((12, 4), 0),
+            "main_brush_left_pct":     props.get((9,  1), 0),
+            "main_brush_time_left_h":  props.get((9,  2), 0),
+            "side_brush_left_pct":     props.get((10, 1), 0),
+            "side_brush_time_left_h":  props.get((10, 2), 0),
+            "filter_left_pct":         props.get((11, 1), 0),
+            "filter_time_left_h":      props.get((11, 2), 0),
+            "sensor_dirty_left_pct":   props.get((16, 1), 0),
+            "wheel_dirty_left_pct":    props.get((30, 1), 0),
+        }

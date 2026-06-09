@@ -211,3 +211,37 @@ def test_build_dreame_headers_mova():
     headers = _build_dreame_headers(brand, access_token=None)
     assert headers["tenant-id"] == "000002"
     assert len(headers["dreame-rlc"]) == 32
+
+from dreame_gateway import _parse_device_list
+
+def test_parse_device_list_mower():
+    records = [{
+        "did": "111",
+        "model": "dreame.mower.r2320",
+        "customName": "Mein Mäher",
+        "bindDomain": "10000.mt.eu.iot.dreame.tech:19973",
+        "online": True,
+    }]
+    devices = _parse_device_list(records)
+    assert len(devices) == 1
+    assert devices[0]["device_type"] == "mower"
+    assert devices[0]["did"] == "111"
+    assert devices[0]["name"] == "Mein Mäher"
+    assert devices[0]["bind_domain"] == "10000.mt.eu.iot.dreame.tech:19973"
+    assert devices[0]["online"] is True
+
+def test_parse_device_list_vacuum():
+    records = [{"did": "222", "model": "dreame.vacuum.r2228o",
+                "customName": "Sauger", "bindDomain": "dom", "online": False}]
+    devices = _parse_device_list(records)
+    assert devices[0]["device_type"] == "vacuum"
+    assert devices[0]["online"] is False
+
+def test_parse_device_list_missing_fields():
+    records = [{"did": "333", "model": "dreame.vacuum.x"}]
+    devices = _parse_device_list(records)
+    assert devices[0]["name"] == "dreame.vacuum.x"  # falls back to model
+    assert devices[0]["bind_domain"] == ""
+
+def test_parse_device_list_empty():
+    assert _parse_device_list([]) == []
