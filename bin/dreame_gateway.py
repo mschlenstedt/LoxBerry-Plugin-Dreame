@@ -748,3 +748,245 @@ class DreameMqttClient:
     def _on_disconnect(self, client, userdata, rc) -> None:
         if rc != 0 and not self._stop_flag.is_set():
             LOGWARN(f"[{self._did}] Dreame MQTT disconnected (rc={rc}), will reconnect...")
+
+
+# ── StateMapper ───────────────────────────────────────────────────────────────
+def map_properties_changed(
+    device: dict,
+    params: list,
+    current_props: dict,
+    mower_settings: dict,
+) -> "dict | None":
+    """Process properties_changed params, update current_props.
+    Returns updated state-JSON dict, {"_trigger_cfg_reload": True}, or None."""
+    updated = False
+    trigger_cfg_reload = False
+
+    for item in params:
+        siid  = item.get("siid")
+        piid  = item.get("piid")
+        value = item.get("value")
+        if siid is None or piid is None:
+            continue
+
+        # Mower binary state (siid=1 piid=1)
+        if device["device_type"] == "mower" and siid == 1 and piid == 1:
+            parsed = parse_binary_state_1(value)
+            if parsed:
+                current_props[(3, 2)] = parsed.get("battery",  current_props.get((3, 2), 0))
+                current_props[(3, 3)] = parsed.get("charging", current_props.get((3, 3), 0))
+                if parsed.get("error_code", 0):
+                    current_props[(3, 5)] = parsed["error_code"]
+                updated = True
+            continue
+
+        # Mower position data (siid=1 piid=4): skip, too technical for Loxone
+        if device["device_type"] == "mower" and siid == 1 and piid == 4:
+            continue
+
+        # CFG reload trigger (siid=2 piid=51)
+        if device["device_type"] == "mower" and siid == 2 and piid == 51:
+            trigger_cfg_reload = True
+            continue
+
+        # AutoSwitch (siid=4 piid=50)
+        if siid == 4 and piid == 50:
+            try:
+                as_data = json.loads(value) if isinstance(value, str) else value
+                switches = _normalize_autoswitch(as_data)
+                for k, v in switches.items():
+                    current_props[("autoswitch", k)] = v
+            except Exception:
+                pass
+            updated = True
+            continue
+
+        current_props[(siid, piid)] = value
+        updated = True
+
+    if trigger_cfg_reload:
+        return {"_trigger_cfg_reload": True}
+    if not updated:
+        return None
+    return build_state_json(device, current_props)
+
+
+# ── CommandHandler ────────────────────────────────────────────────────────────
+MOWER_ACTIONS: dict = {
+    "start":         {"siid": 2, "aiid": 1,  "in": []},
+    "stop":          {"siid": 2, "aiid": 2,  "in": []},
+    "pause":         {"siid": 2, "aiid": 4,  "in": []},
+    "dock":          {"siid": 5, "aiid": 3,  "in": []},
+    "clear_warning": {"siid": 4, "aiid": 3,  "in": []},
+}
+MOWER_SPECIAL: dict = {
+    "find": {"m": "a", "p": 0, "o": 9},
+    "lock": {"m": "a", "p": 0, "o": 12},
+}
+VACUUM_ACTIONS: dict = {
+    "start":         {"siid": 2, "aiid": 1,  "in": []},
+    "pause":         {"siid": 2, "aiid": 2,  "in": []},
+    "stop":          {"siid": 4, "aiid": 2,  "in": []},
+    "dock":          {"siid": 3, "aiid": 1,  "in": []},
+    "locate":        {"siid": 7, "aiid": 1,  "in": []},
+    "auto_empty":    {"siid": 15,"aiid": 1,  "in": []},
+    "start_washing": {"siid": 4, "aiid": 4,  "in": []},
+    "clear_warning": {"siid": 4, "aiid": 3,  "in": []},
+}
+VACUUM_SETTINGS: dict = {
+    "suction_level":        (4, 4),
+    "water_volume":         (4, 5),
+    "cleaning_mode":        (4, 23),
+    "volume":               (7, 1),
+    "child_lock":           (4, 27),
+    "carpet_boost":         (4, 12),
+    "carpet_cleaning":      (4, 36),
+    "carpet_sensitivity":   (4, 28),
+    "carpet_recognition":   (4, 33),
+    "drying_time":          (4, 40),
+    "auto_water_refilling": (4, 51),
+    "auto_add_detergent":   (4, 37),
+    "mop_wash_level":       (4, 46),
+    "dnd_enable":           (5, 1),
+    "dnd_start":            (5, 2),
+    "dnd_end":              (5, 3),
+    "auto_dust_collecting": (15, 1),
+    "auto_empty_frequency": (15, 2),
+    "water_temperature":    (28, 8),
+    "wetness_level":        (28, 1),
+    "silent_drying":        (28, 27),
+    "hair_compression":     (28, 28),
+}
+VACUUM_AUTOSWITCH: dict = {
+    "auto_drying":           "AutoDry",
+    "smart_charging":        "SmartCharge",
+    "stain_avoidance":       "StainIdentify",
+    "collision_avoidance":   "LessColl",
+    "max_suction":           "SuctionMax",
+    "hot_washing":           "HotWash",
+    "uv_sterilization":      "UVLight",
+    "ultra_clean_mode":      "SuperWash",
+    "mop_extend":            "MopExtrSwitch",
+    "self_clean_frequency":  "BackWashType",
+}
+MOWER_AUTOSWITCH: dict = {
+    "collision_avoidance":   "LessColl",
+    "auto_charging":         "SmartCharge",
+    "clean_genius":          "SmartHost",
+    "cleaning_route":        "CleanRoute",
+}
+MOWER_PRE_SETTINGS: dict = {
+    "mow_mode":         1,
+    "cutting_height":   2,
+    "direction_change": 5,
+    "edge_detection":   8,
+    "edge_mowing":      9,
+}
+MOWER_CFG_SETTINGS: dict = {
+    "rain_protection":  lambda v: {"m": "s", "t": "WRP",  "d": v if isinstance(v, dict) else {"value": int(v)}},
+    "frost_protection": lambda v: {"m": "s", "t": "FDP",  "d": {"value": int(v)}},
+    "volume":           lambda v: {"m": "s", "t": "VOL",  "d": {"value": int(v)}},
+    "child_lock":       lambda v: {"m": "s", "t": "CLS",  "d": {"value": int(v)}},
+    "anti_theft":       lambda v: {"m": "s", "t": "STUN", "d": {"value": int(v)}},
+    "ai_obstacle":      lambda v: {"m": "s", "t": "AOP",  "d": {"value": int(v)}},
+    "grass_protection": lambda v: {"m": "s", "t": "PROT", "d": {"value": int(v)}},
+    "path_display":     lambda v: {"m": "s", "t": "PATH", "d": {"value": int(v)}},
+    "low_speed":        lambda v: {"m": "s", "t": "LOW",  "d": v},
+    "headlight":        lambda v: {"m": "s", "t": "LIT",  "d": v},
+}
+MOWER_PROP_SETTINGS: dict = {
+    "dnd_enable":         (5, 1),
+    "obstacle_avoidance": (4, 21),
+    "schedule":           (8, 2),
+}
+
+
+async def handle_set_command(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    device: dict,
+    command: str,
+) -> "tuple[str, int]":
+    """Execute a set command. Returns (result_str, result_num)."""
+    did = device["did"]
+    dt  = device["device_type"]
+    try:
+        if dt == "mower":
+            if command in MOWER_SPECIAL:
+                await send_mower_command(session, brand, access_token, did, MOWER_SPECIAL[command])
+            elif command in MOWER_ACTIONS:
+                action = MOWER_ACTIONS[command]
+                params = {**action, "did": did}
+                await send_command(session, brand, access_token, did, "action", params)
+            else:
+                return "error", 1
+        else:
+            if command in VACUUM_ACTIONS:
+                action = VACUUM_ACTIONS[command]
+                params = {**action, "did": did}
+                await send_command(session, brand, access_token, did, "action", params)
+            else:
+                return "error", 1
+        return "ok", 0
+    except Exception as e:
+        LOGERR(f"[{did}] set '{command}' error: {e}")
+        return "error", 1
+
+
+async def handle_settings_command(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    device: dict,
+    key: str,
+    value,
+    current_pre_array: list,
+) -> "tuple[str, int]":
+    """Execute a settings/{key} command. Returns (result_str, result_num)."""
+    did = device["did"]
+    dt  = device["device_type"]
+    try:
+        if dt == "vacuum":
+            if key in VACUUM_SETTINGS:
+                siid, piid = VACUUM_SETTINGS[key]
+                params = [{"did": did, "siid": siid, "piid": piid, "value": value}]
+                await send_command(session, brand, access_token, did, "set_properties", params)
+            elif key in VACUUM_AUTOSWITCH:
+                as_key = VACUUM_AUTOSWITCH[key]
+                as_val = json.dumps({"k": as_key, "v": int(value)})
+                params = [{"did": did, "siid": 4, "piid": 50, "value": as_val}]
+                await send_command(session, brand, access_token, did, "set_properties", params)
+            elif key == "schedule":
+                params = [{"did": did, "siid": 8, "piid": 2, "value": value}]
+                await send_command(session, brand, access_token, did, "set_properties", params)
+            else:
+                return "error", 1
+        else:  # mower
+            if key in MOWER_AUTOSWITCH:
+                as_key = MOWER_AUTOSWITCH[key]
+                as_val = json.dumps({"k": as_key, "v": int(value)})
+                params = [{"did": did, "siid": 4, "piid": 50, "value": as_val}]
+                await send_command(session, brand, access_token, did, "set_properties", params)
+            elif key in MOWER_CFG_SETTINGS:
+                payload = MOWER_CFG_SETTINGS[key](value)
+                await send_mower_command(session, brand, access_token, did, payload)
+            elif key in MOWER_PROP_SETTINGS:
+                siid, piid = MOWER_PROP_SETTINGS[key]
+                params = [{"did": did, "siid": siid, "piid": piid, "value": value}]
+                await send_command(session, brand, access_token, did, "set_properties", params)
+            elif key in MOWER_PRE_SETTINGS:
+                # PRE Read-Modify-Write
+                idx = MOWER_PRE_SETTINGS[key]
+                pre = list(current_pre_array)
+                while len(pre) <= idx:
+                    pre.append(0)
+                pre[idx] = int(value)
+                payload = {"m": "s", "t": "PRE", "d": {"value": pre}}
+                await send_mower_command(session, brand, access_token, did, payload)
+            else:
+                return "error", 1
+        return "ok", 0
+    except Exception as e:
+        LOGERR(f"[{did}] settings/{key} error: {e}")
+        return "error", 1

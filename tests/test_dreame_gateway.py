@@ -259,3 +259,64 @@ def test_next_request_id_cycles():
         assert _next_request_id() == 2
     finally:
         _dg._request_id = orig
+
+from dreame_gateway import map_properties_changed
+
+def _make_mower_device():
+    return {"did": "123", "model": "dreame.mower.r2320", "name": "Mäher",
+            "device_type": "mower", "online": True}
+
+def _make_vacuum_device():
+    return {"did": "456", "model": "dreame.vacuum.x", "name": "Sauger",
+            "device_type": "vacuum", "online": True}
+
+def test_map_properties_changed_basic_mower():
+    device = _make_mower_device()
+    props = {}
+    params = [
+        {"siid": 3, "piid": 1, "value": 1},  # status=Working
+        {"siid": 3, "piid": 2, "value": 85}, # battery=85
+    ]
+    result = map_properties_changed(device, params, props, {})
+    assert result is not None
+    assert result.get("_trigger_cfg_reload") is not True
+    assert props[(3, 1)] == 1
+    assert props[(3, 2)] == 85
+    assert result["status"] == 1
+    assert result["battery"] == 85
+
+def test_map_properties_changed_binary_siid1_piid1():
+    device = _make_mower_device()
+    props = {}
+    buf = bytearray(20)
+    buf[11] = 0b01010101  # battery=85, charging=0
+    params = [{"siid": 1, "piid": 1, "value": list(buf)}]
+    result = map_properties_changed(device, params, props, {})
+    assert result is not None
+    assert props[(3, 2)] == 85  # battery written to (3,2)
+    assert props[(3, 3)] == 0   # charging written to (3,3)
+
+def test_map_properties_changed_cfg_reload_trigger():
+    device = _make_mower_device()
+    props = {}
+    params = [{"siid": 2, "piid": 51, "value": 1}]
+    result = map_properties_changed(device, params, props, {})
+    assert result == {"_trigger_cfg_reload": True}
+
+def test_map_properties_changed_none_on_empty():
+    device = _make_mower_device()
+    props = {}
+    result = map_properties_changed(device, [], props, {})
+    assert result is None
+
+def test_map_properties_changed_vacuum_props():
+    device = _make_vacuum_device()
+    props = {}
+    params = [
+        {"siid": 4, "piid": 1, "value": 1},  # status
+        {"siid": 3, "piid": 1, "value": 78},  # battery
+    ]
+    result = map_properties_changed(device, params, props, {})
+    assert result is not None
+    assert result["status"] == 1
+    assert result["battery"] == 78
