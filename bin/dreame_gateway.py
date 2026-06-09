@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 
 import aiohttp
+import paho.mqtt.client as paho_mqtt
+import threading
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
@@ -658,9 +660,6 @@ async def load_statistic(
 
 
 # ── Dreame Cloud MQTT ─────────────────────────────────────────────────────────
-import paho.mqtt.client as paho_mqtt
-import threading
-
 
 class DreameMqttClient:
     """paho-MQTT client for Dreame Cloud MQTTS, runs in its own thread.
@@ -685,7 +684,11 @@ class DreameMqttClient:
         self._loop  = loop
 
         client_id    = "p_" + secrets.token_hex(8)
-        self._client = paho_mqtt.Client(client_id=client_id)
+        self._client = paho_mqtt.Client(
+            callback_api_version=paho_mqtt.CallbackAPIVersion.VERSION1,
+            client_id=client_id,
+            reconnect_on_failure=False,
+        )
         self._client.username_pw_set(uid, access_token)
 
         # TLS — Dreame cloud uses self-signed certificates
