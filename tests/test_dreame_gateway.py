@@ -188,3 +188,26 @@ def test_get_mqtt_broker_config_external_tls():
     assert broker["tls"] is True
     assert broker["port"] == 8884
     assert broker["tls_verify"] is True
+
+from dreame_gateway import _build_dreame_headers, BRAND_CONFIG
+
+def test_build_dreame_headers_no_token():
+    brand = BRAND_CONFIG["dreame"]
+    headers = _build_dreame_headers(brand, access_token=None)
+    assert headers["tenant-id"] == "000000"
+    assert headers["dreame-meta"] == "cv=i_829"
+    assert "dreame-rlc" in headers
+    assert len(headers["dreame-rlc"]) == 32
+    assert "dreame-auth" not in headers
+
+def test_build_dreame_headers_with_token():
+    brand = BRAND_CONFIG["dreame"]
+    headers = _build_dreame_headers(brand, access_token="abc123")
+    assert headers["dreame-auth"] == "bearer abc123"
+    assert headers["tenant-id"] == "000000"
+
+def test_build_dreame_headers_mova():
+    brand = BRAND_CONFIG["mova"]
+    headers = _build_dreame_headers(brand, access_token=None)
+    assert headers["tenant-id"] == "000002"
+    assert len(headers["dreame-rlc"]) == 32

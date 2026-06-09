@@ -358,3 +358,80 @@ _shutdown_event: asyncio.Event = asyncio.Event()
 def _handle_sigterm(*_) -> None:
     LOGINF("SIGTERM received — shutting down")
     _shutdown_event.set()
+
+
+# ── Dreame Auth ───────────────────────────────────────────────────────────────
+import aiohttp
+
+
+def _build_dreame_headers(brand: dict, access_token: "str | None" = None) -> dict:
+    """Build required HTTP headers for Dreame cloud API calls."""
+    headers = {
+        "user-agent":    "Dart/3.2 (dart:io)",
+        "dreame-meta":   brand["meta"],
+        "dreame-rlc":    _compute_rlc(brand["rlc_key"]),
+        "tenant-id":     brand["tenant_id"],
+        "authorization": brand["authorization"],
+    }
+    if access_token:
+        headers["dreame-auth"] = f"bearer {access_token}"
+    return headers
+
+
+async def dreame_login(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    username: str,
+    password: str,
+) -> dict:
+    """POST /dreame-auth/oauth/token → {access_token, refresh_token, expires_in, uid}."""
+    headers = _build_dreame_headers(brand)
+    headers["content-type"] = "application/x-www-form-urlencoded"
+    data = {
+        "grant_type": "password",
+        "scope":      "all",
+        "platform":   "IOS",
+        "type":       "account",
+        "username":   username,
+        "password":   _md5_password(password),
+        "country":    "DE",
+        "lang":       "de",
+    }
+    url = f"https://{brand['domain']}/dreame-auth/oauth/token"
+    async with session.post(url, headers=headers, data=data, ssl=False) as resp:
+        resp.raise_for_status()
+        body = await resp.json(content_type=None)
+    if "access_token" not in body:
+        raise RuntimeError(f"Login failed: {body}")
+    return {
+        "access_token":  body["access_token"],
+        "refresh_token": body.get("refresh_token", ""),
+        "expires_in":    int(body.get("expires_in", 3600)),
+        "uid":           str(body.get("uid", "")),
+    }
+
+
+async def dreame_refresh_token(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    refresh_token: str,
+) -> dict:
+    """POST /dreame-auth/oauth/token with grant_type=refresh_token."""
+    headers = _build_dreame_headers(brand)
+    headers["content-type"] = "application/x-www-form-urlencoded"
+    data = {
+        "grant_type":    "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    url = f"https://{brand['domain']}/dreame-auth/oauth/token"
+    async with session.post(url, headers=headers, data=data, ssl=False) as resp:
+        resp.raise_for_status()
+        body = await resp.json(content_type=None)
+    if "access_token" not in body:
+        raise RuntimeError(f"Token refresh failed: {body}")
+    return {
+        "access_token":  body["access_token"],
+        "refresh_token": body.get("refresh_token", refresh_token),
+        "expires_in":    int(body.get("expires_in", 3600)),
+        "uid":           str(body.get("uid", "")),
+    }
