@@ -139,6 +139,7 @@ def test_load_plugin_config_defaults(tmp_path):
         assert cfg["expires_at"] == 0
         assert cfg["uid"] == ""
         assert cfg["username"] == ""
+        assert cfg["password_hash"] == ""
     finally:
         dreame_gateway.PLUGIN_CFG = orig
 
