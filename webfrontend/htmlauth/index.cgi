@@ -107,7 +107,7 @@ if ($form eq 'gateway') {
     $tmpl->param(LOGLIST => LoxBerry::Web::loglist_html());
 }
 
-LoxBerry::Web::lbheader("Dreame Gateway V$version", "dreame", "");
+LoxBerry::Web::lbheader("Dreame Gateway V$version", "dreame", "", "nojqm");
 print $tmpl->output();
 LoxBerry::Web::lbfooter();
 exit;

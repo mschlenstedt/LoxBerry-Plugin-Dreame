@@ -3,14 +3,14 @@
 </TMPL_IF>
 
 <div class="lb-section-title">Cloud-Konfiguration</div>
-<form method="post" onsubmit="return true;" data-enhance="false">
+<form method="post" onsubmit="return true;">
 <input type="hidden" name="form"   value="config">
 <input type="hidden" name="action" value="save_config">
 
 <div class="lb-form-row">
   <label class="lb-form-label" for="cloud_service">Cloud-Dienst</label>
   <div class="lb-form-field">
-    <select class="lb-select" name="cloud_service" id="cloud_service" data-role="none">
+    <select class="lb-select" name="cloud_service" id="cloud_service">
       <option value="dreame" <TMPL_IF IS_DREAME>selected</TMPL_IF>>Dreame</option>
       <option value="mova"   <TMPL_IF IS_MOVA>selected</TMPL_IF>>MOVA</option>
     </select>
@@ -45,11 +45,11 @@
 <div class="lb-form-row">
   <label class="lb-form-label" for="polling_interval_min">Statistik-Intervall (min)</label>
   <div class="lb-form-field">
-    <input class="lb-input" type="number" name="polling_interval_min" id="polling_interval_min" value="<TMPL_VAR POLLING_INTERVAL_MIN>" min="5" max="1440" data-role="none">
+    <input class="lb-input" type="number" name="polling_interval_min" id="polling_interval_min" value="<TMPL_VAR POLLING_INTERVAL_MIN>" min="5" max="1440">
   </div>
 </div>
 
 <div style="margin-top:1.5rem;">
-  <button type="submit" class="lb-btn lb-btn-primary lb-btn-icon" data-role="none"><i class="pi pi-save"></i> Speichern</button>
+  <button type="submit" class="lb-btn lb-btn-primary lb-btn-icon"><i class="pi pi-save"></i> Speichern</button>
 </div>
 </form>
