@@ -655,3 +655,93 @@ async def load_statistic(
             "sensor_dirty_left_pct":   props.get((16, 1), 0),
             "wheel_dirty_left_pct":    props.get((30, 1), 0),
         }
+
+
+# ── Dreame Cloud MQTT ─────────────────────────────────────────────────────────
+import paho.mqtt.client as paho_mqtt
+import threading
+
+
+class DreameMqttClient:
+    """paho-MQTT client for Dreame Cloud MQTTS, runs in its own thread.
+    State updates are forwarded via asyncio.Queue to the asyncio event loop."""
+
+    def __init__(
+        self,
+        bind_domain: str,
+        did: str,
+        uid: str,
+        access_token: str,
+        queue: asyncio.Queue,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        host_port   = bind_domain.split(":")
+        self._host  = host_port[0]
+        self._port  = int(host_port[1]) if len(host_port) > 1 else 8883
+        self._did   = did
+        self._uid   = uid
+        self._token = access_token
+        self._queue = queue
+        self._loop  = loop
+
+        client_id    = "p_" + secrets.token_hex(8)
+        self._client = paho_mqtt.Client(client_id=client_id)
+        self._client.username_pw_set(uid, access_token)
+
+        # TLS — Dreame cloud uses self-signed certificates
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        self._client.tls_set_context(ctx)
+
+        self._client.on_connect    = self._on_connect
+        self._client.on_message    = self._on_message
+        self._client.on_disconnect = self._on_disconnect
+
+        self._thread: "threading.Thread | None" = None
+        self._stop_flag = threading.Event()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"dreame-mqtt-{self._did}"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_flag.set()
+        self._client.disconnect()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop_flag.is_set():
+            try:
+                LOGINF(f"[{self._did}] Connecting Dreame Cloud MQTT {self._host}:{self._port}")
+                self._client.connect(self._host, self._port, keepalive=60)
+                self._client.loop_forever()
+            except Exception as e:
+                LOGERR(f"[{self._did}] Dreame MQTT error: {e}")
+                if not self._stop_flag.is_set():
+                    time.sleep(10)
+
+    def _on_connect(self, client, userdata, flags, rc) -> None:
+        if rc == 0:
+            topic = f"/status/{self._did}/{self._uid}/#"
+            client.subscribe(topic, qos=0)
+            LOGOK(f"[{self._did}] Dreame MQTT connected, subscribed: {topic}")
+        else:
+            LOGERR(f"[{self._did}] Dreame MQTT connection failed: rc={rc}")
+
+    def _on_message(self, client, userdata, msg) -> None:
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+            asyncio.run_coroutine_threadsafe(
+                self._queue.put({"did": self._did, "payload": payload}),
+                self._loop,
+            )
+        except Exception as e:
+            LOGWARN(f"[{self._did}] Dreame MQTT message parse error: {e}")
+
+    def _on_disconnect(self, client, userdata, rc) -> None:
+        if rc != 0 and not self._stop_flag.is_set():
+            LOGWARN(f"[{self._did}] Dreame MQTT disconnected (rc={rc}), will reconnect...")
