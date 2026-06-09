@@ -610,7 +610,7 @@ async def load_mower_history(
         "time_end": now,
         "limit": 20,
         "from": 0,
-        "region": "eu",
+        "region": "eu",  # plugin targets EU cloud only
     }
     async with session.post(url, headers=headers, json=body, ssl=False) as resp:
         resp.raise_for_status()

@@ -245,3 +245,17 @@ def test_parse_device_list_missing_fields():
 
 def test_parse_device_list_empty():
     assert _parse_device_list([]) == []
+
+from dreame_gateway import _next_request_id
+import dreame_gateway as _dg
+
+def test_next_request_id_cycles():
+    # Save and restore module state
+    orig = _dg._request_id
+    try:
+        _dg._request_id = 99998
+        assert _next_request_id() == 99999
+        assert _next_request_id() == 1   # wraps around
+        assert _next_request_id() == 2
+    finally:
+        _dg._request_id = orig
