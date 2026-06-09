@@ -9,12 +9,12 @@ from dreame_gateway import _compute_rlc, _md5_password
 def test_compute_rlc_dreame():
     # AES-128-ECB("EETjszu*XI5znHsI", "eu|en|DE" padded PKCS7) → deterministic hex
     result = _compute_rlc("EETjszu*XI5znHsI")
-    assert isinstance(result, str)
+    assert result == "7787607c258cdd79141ec1866eb5476c"  # known-vector
     assert len(result) == 32  # 16 bytes AES block → 32 hex chars
 
 def test_compute_rlc_mova():
     result = _compute_rlc("gigxlmqwZ]7oWZUF")
-    assert isinstance(result, str)
+    assert result == "e5828c1d3144dc8d6815f24fa67a5e3f"  # known-vector
     assert len(result) == 32
 
 def test_compute_rlc_deterministic():

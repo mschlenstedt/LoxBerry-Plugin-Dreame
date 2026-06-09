@@ -57,5 +57,5 @@ def _compute_rlc(rlc_key: str) -> str:
 
 
 def _md5_password(password: str) -> str:
-    """MD5(password + salt) → hex string."""
+    """MD5(password + salt) → hex string. Protocol-mandated by Dreame cloud API."""
     return hashlib.md5((password + "RAylYC%fmSKp7%Tq").encode()).hexdigest()
