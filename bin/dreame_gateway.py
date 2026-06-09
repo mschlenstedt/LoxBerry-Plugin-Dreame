@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import aiohttp
+import aiomqtt
 import paho.mqtt.client as paho_mqtt
 import threading
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -990,3 +991,341 @@ async def handle_settings_command(
     except Exception as e:
         LOGERR(f"[{did}] settings/{key} error: {e}")
         return "error", 1
+
+
+# ── Async Tasks ───────────────────────────────────────────────────────────────
+
+
+async def task_dreame_to_lbmqtt(
+    device: dict,
+    queue: asyncio.Queue,
+    broker: dict,
+    base_topic: str,
+    session: aiohttp.ClientSession,
+    brand: dict,
+    cfg: dict,
+    mower_settings: "dict | None",
+) -> None:
+    """Receive state updates from Dreame Cloud queue, publish to LoxBerry MQTT."""
+    did = device["did"]
+    dt  = device["device_type"]
+    current_props: dict = {}
+    current_pre  : list = mower_settings.get("_pre_array", []) if mower_settings else []
+
+    mqtt_kwargs = _build_mqtt_kwargs(broker)
+    while not _shutdown_event.is_set():
+        try:
+            async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
+                LOGOK(f"[{did}] LoxBerry MQTT publisher connected")
+                while not _shutdown_event.is_set():
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    payload = item.get("payload", {})
+                    data    = payload.get("data", {})
+                    method  = data.get("method", "")
+                    if method != "properties_changed":
+                        continue
+                    result = map_properties_changed(
+                        device, data.get("params", []), current_props,
+                        mower_settings or {}
+                    )
+                    if result is None:
+                        continue
+                    if result.get("_trigger_cfg_reload"):
+                        LOGINF(f"[{did}] CFG reload triggered")
+                        try:
+                            mower_settings = await load_mower_settings(
+                                session, brand, cfg["access_token"], did
+                            )
+                            current_pre = mower_settings.get("_pre_array", [])
+                            state = build_state_json(device, current_props)
+                            state.update({k: v for k, v in mower_settings.items() if not k.startswith("_")})
+                            await lbmqtt.publish(f"{base_topic}/{did}/state", json.dumps(state), retain=True)
+                        except Exception as e:
+                            LOGERR(f"[{did}] CFG reload error: {e}")
+                        continue
+                    await lbmqtt.publish(f"{base_topic}/{did}/state", json.dumps(result), retain=True)
+                    if dt == "vacuum":
+                        station = build_station_json(current_props)
+                        await lbmqtt.publish(
+                            f"{base_topic}/{did}/state_station",
+                            json.dumps(station),
+                            retain=True,
+                        )
+        except aiomqtt.MqttError as e:
+            if not _shutdown_event.is_set():
+                LOGWARN(f"[{did}] LoxBerry MQTT publisher disconnected: {e} — reconnect in 5s")
+                await asyncio.sleep(5)
+        except Exception as e:
+            LOGERR(f"[{did}] task_dreame_to_lbmqtt error: {e}")
+            await asyncio.sleep(5)
+
+
+async def task_lbmqtt_to_dreame(
+    device: dict,
+    broker: dict,
+    base_topic: str,
+    session: aiohttp.ClientSession,
+    brand: dict,
+    cfg: dict,
+    pre_array_ref: list,
+) -> None:
+    """Subscribe to LoxBerry MQTT set/settings, dispatch commands to Dreame cloud."""
+    did            = device["did"]
+    set_topic      = f"{base_topic}/{did}/set"
+    settings_topic = f"{base_topic}/{did}/settings/#"
+    mqtt_kwargs    = _build_mqtt_kwargs(broker)
+
+    while not _shutdown_event.is_set():
+        try:
+            async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
+                await lbmqtt.subscribe(set_topic)
+                await lbmqtt.subscribe(settings_topic)
+                LOGINF(f"[{did}] Subscribed: {set_topic}, {settings_topic}")
+                async with lbmqtt.messages() as messages:
+                    async for msg in messages:
+                        if _shutdown_event.is_set():
+                            break
+                        topic_str   = str(msg.topic)
+                        payload_str = msg.payload.decode("utf-8").strip()
+                        result_str, result_num = "error", 1
+                        command_name = ""
+                        try:
+                            if topic_str == set_topic:
+                                command_name = payload_str
+                                result_str, result_num = await handle_set_command(
+                                    session, brand, cfg["access_token"], device, payload_str
+                                )
+                            elif "/settings/" in topic_str:
+                                key = topic_str.split("/settings/")[-1]
+                                command_name = f"settings/{key}"
+                                try:
+                                    value = json.loads(payload_str)
+                                except json.JSONDecodeError:
+                                    value = payload_str
+                                result_str, result_num = await handle_settings_command(
+                                    session, brand, cfg["access_token"], device,
+                                    key, value, pre_array_ref
+                                )
+                        except Exception as e:
+                            LOGERR(f"[{did}] Command '{command_name}' error: {e}")
+                        result_payload = json.dumps({
+                            "command":    command_name,
+                            "result":     result_str,
+                            "result_num": result_num,
+                            "reason":     "none" if result_str == "ok" else str(result_num),
+                        })
+                        await lbmqtt.publish(f"{base_topic}/{did}/command_result", result_payload)
+        except aiomqtt.MqttError as e:
+            if not _shutdown_event.is_set():
+                LOGWARN(f"[{did}] LoxBerry MQTT subscriber disconnected: {e} — reconnect in 5s")
+                await asyncio.sleep(5)
+        except Exception as e:
+            LOGERR(f"[{did}] task_lbmqtt_to_dreame error: {e}")
+            await asyncio.sleep(5)
+
+
+async def task_token_refresh(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    cfg: dict,
+    cfg_lock: asyncio.Lock,
+) -> None:
+    """Refresh access token 5 minutes before expiry; fall back to re-login on error."""
+    while not _shutdown_event.is_set():
+        await asyncio.sleep(30)
+        now        = time.time()
+        expires_at = cfg.get("expires_at", 0)
+        if expires_at == 0 or now < expires_at - 300:
+            continue
+        LOGINF("Token expiring — refreshing")
+        async with cfg_lock:
+            try:
+                tokens = await dreame_refresh_token(session, brand, cfg["refresh_token"])
+                cfg["access_token"]  = tokens["access_token"]
+                cfg["refresh_token"] = tokens["refresh_token"]
+                cfg["expires_at"]    = time.time() + tokens["expires_in"]
+                save_plugin_config(cfg)
+                LOGOK("Token refreshed successfully")
+            except Exception as e:
+                LOGERR(f"Token refresh failed ({e}) — attempting re-login")
+                try:
+                    tokens = await dreame_login(
+                        session, brand, cfg["username"],
+                        cfg.get("_password_plain", "")
+                    )
+                    cfg["access_token"]  = tokens["access_token"]
+                    cfg["refresh_token"] = tokens["refresh_token"]
+                    cfg["uid"]           = tokens["uid"]
+                    cfg["expires_at"]    = time.time() + tokens["expires_in"]
+                    save_plugin_config(cfg)
+                    LOGOK("Re-login successful")
+                except Exception as e2:
+                    LOGERR(f"Re-login failed: {e2}")
+
+
+async def task_statistic_poll(
+    devices: list,
+    session: aiohttp.ClientSession,
+    brand: dict,
+    cfg: dict,
+    broker: dict,
+    base_topic: str,
+) -> None:
+    """Poll statistics/consumables periodically (default 30 min)."""
+    interval = int(cfg.get("polling_interval_min", 30)) * 60
+    while not _shutdown_event.is_set():
+        await asyncio.sleep(interval)
+        for device in devices:
+            if _shutdown_event.is_set():
+                break
+            did = device["did"]
+            try:
+                stat = await load_statistic(
+                    session, brand, cfg["access_token"], did, device["device_type"]
+                )
+                if device["device_type"] == "mower":
+                    history = await load_mower_history(
+                        session, brand, cfg["access_token"], did, cfg["uid"]
+                    )
+                    if history:
+                        last = history[0]
+                        stat["last_mow_date"]         = last.get("time", 0)
+                        stat["last_mow_duration_min"] = last.get("duration", 0)
+                        stat["last_mow_area_m2"]      = last.get("area", 0)
+                        stat["last_mow_completed"]    = last.get("completed", False)
+                mqtt_kwargs = _build_mqtt_kwargs(broker)
+                async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
+                    await lbmqtt.publish(
+                        f"{base_topic}/{did}/statistic",
+                        json.dumps(stat),
+                        retain=True,
+                    )
+                LOGDEB(f"[{did}] Statistic published")
+            except Exception as e:
+                LOGERR(f"[{did}] Statistic poll error: {e}")
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+async def _async_main() -> None:
+    LOGSTART("Dreame Gateway started")
+    write_pid()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT,  _handle_sigterm)
+
+    cfg     = load_plugin_config()
+    general = _load_json(GENERAL_JSON)
+    broker  = get_mqtt_broker_config(general)
+    brand   = BRAND_CONFIG.get(cfg.get("cloud_service", "dreame"), BRAND_CONFIG["dreame"])
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # Token check / login
+        if not cfg.get("access_token") or time.time() >= cfg.get("expires_at", 0) - 60:
+            LOGINF("No valid token — logging in")
+            password_plain = cfg.get("_password_plain", "")
+            if not password_plain:
+                LOGERR("No password in config — please log in via WebUI")
+                return
+            tokens = await dreame_login(session, brand, cfg["username"], password_plain)
+            cfg["access_token"]  = tokens["access_token"]
+            cfg["refresh_token"] = tokens["refresh_token"]
+            cfg["uid"]           = tokens["uid"]
+            cfg["expires_at"]    = time.time() + tokens["expires_in"]
+            save_plugin_config(cfg)
+
+        # Load device list (fall back to cached)
+        devices = cfg.get("devices", [])
+        try:
+            devices = await get_device_list(session, brand, cfg["access_token"])
+            cfg["devices"] = devices
+            save_plugin_config(cfg)
+            LOGOK(f"{len(devices)} device(s) found")
+        except Exception as e:
+            LOGWARN(f"Could not load device list ({e}), using cache")
+
+        if not devices:
+            LOGERR("No devices found — gateway exiting")
+            return
+
+        cfg_lock   = asyncio.Lock()
+        loop       = asyncio.get_running_loop()
+        base_topic = cfg.get("base_topic", "dreame")
+
+        tasks_coro  = []
+        dreame_clients = []
+
+        for device in devices:
+            did  = device["did"]
+            bind = device.get("bind_domain", "")
+            queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+            # Mower: load settings at startup
+            mower_settings = None
+            pre_array_ref  = []
+            if device["device_type"] == "mower":
+                try:
+                    mower_settings = await load_mower_settings(
+                        session, brand, cfg["access_token"], did
+                    )
+                    pre_array_ref = mower_settings.get("_pre_array", [])
+                    LOGOK(f"[{did}] Mower settings loaded")
+                except Exception as e:
+                    LOGWARN(f"[{did}] Mower settings error: {e}")
+
+            # Vacuum: load station properties at startup
+            if device["device_type"] == "vacuum" and bind:
+                try:
+                    station_props = await get_properties(
+                        session, brand, cfg["access_token"], did,
+                        [(25, 1), (25, 2), (25, 3), (25, 4), (25, 5)]
+                    )
+                    mqtt_kwargs = _build_mqtt_kwargs(broker)
+                    async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
+                        station = build_station_json(station_props)
+                        await lbmqtt.publish(
+                            f"{base_topic}/{did}/state_station",
+                            json.dumps(station),
+                            retain=True,
+                        )
+                except Exception as e:
+                    LOGWARN(f"[{did}] Station props error: {e}")
+
+            # Start Dreame cloud MQTT
+            if bind:
+                dc = DreameMqttClient(bind, did, cfg["uid"], cfg["access_token"], queue, loop)
+                dc.start()
+                dreame_clients.append(dc)
+
+            tasks_coro.append(task_dreame_to_lbmqtt(
+                device, queue, broker, base_topic, session, brand, cfg, mower_settings
+            ))
+            tasks_coro.append(task_lbmqtt_to_dreame(
+                device, broker, base_topic, session, brand, cfg, pre_array_ref
+            ))
+
+        tasks_coro.append(task_token_refresh(session, brand, cfg, cfg_lock))
+        tasks_coro.append(task_statistic_poll(devices, session, brand, cfg, broker, base_topic))
+
+        all_tasks = [asyncio.create_task(c) for c in tasks_coro]
+        await _shutdown_event.wait()
+
+        for dc in dreame_clients:
+            dc.stop()
+        for t in all_tasks:
+            t.cancel()
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    remove_pid()
+    _logend()
+    LOGINF("Dreame Gateway stopped")
+
+
+def main() -> None:
+    asyncio.run(_async_main())
+
+
+if __name__ == "__main__":
+    main()
