@@ -479,7 +479,10 @@ async def get_device_list(
     async with session.post(url, headers=headers, json=body, ssl=False) as resp:
         resp.raise_for_status()
         data = await resp.json(content_type=None)
-    records = data.get("result", {}).get("records", [])
+    records = (
+        data.get("data", {}).get("page", {}).get("records")
+        or data.get("result", {}).get("records", [])
+    )
     return _parse_device_list(records)
 
 
@@ -1084,41 +1087,40 @@ async def task_lbmqtt_to_dreame(
                 await lbmqtt.subscribe(set_topic)
                 await lbmqtt.subscribe(settings_topic)
                 LOGINF(f"[{did}] Subscribed: {set_topic}, {settings_topic}")
-                async with lbmqtt.messages() as messages:
-                    async for msg in messages:
-                        if _shutdown_event.is_set():
-                            break
-                        topic_str   = str(msg.topic)
-                        payload_str = msg.payload.decode("utf-8").strip()
-                        result_str, result_num = "error", 1
-                        command_name = ""
-                        try:
-                            if topic_str == set_topic:
-                                command_name = payload_str
-                                result_str, result_num = await handle_set_command(
-                                    session, brand, cfg["access_token"], device, payload_str
-                                )
-                            elif "/settings/" in topic_str:
-                                key = topic_str.split("/settings/")[-1]
-                                command_name = f"settings/{key}"
-                                try:
-                                    value = json.loads(payload_str)
-                                except json.JSONDecodeError:
-                                    value = payload_str
-                                result_str, result_num = await handle_settings_command(
-                                    session, brand, cfg["access_token"], device,
-                                    key, value, pre_array_ref
-                                )
-                        except Exception as e:
-                            LOGERR(f"[{did}] Command '{command_name}' error: {e}")
-                            continue
-                        result_payload = json.dumps({
-                            "command":    command_name,
-                            "result":     result_str,
-                            "result_num": result_num,
-                            "reason":     "none" if result_str == "ok" else str(result_num),
-                        })
-                        await lbmqtt.publish(f"{base_topic}/{did}/command_result", result_payload)
+                async for msg in lbmqtt.messages:
+                    if _shutdown_event.is_set():
+                        break
+                    topic_str   = str(msg.topic)
+                    payload_str = msg.payload.decode("utf-8").strip()
+                    result_str, result_num = "error", 1
+                    command_name = ""
+                    try:
+                        if topic_str == set_topic:
+                            command_name = payload_str
+                            result_str, result_num = await handle_set_command(
+                                session, brand, cfg["access_token"], device, payload_str
+                            )
+                        elif "/settings/" in topic_str:
+                            key = topic_str.split("/settings/")[-1]
+                            command_name = f"settings/{key}"
+                            try:
+                                value = json.loads(payload_str)
+                            except json.JSONDecodeError:
+                                value = payload_str
+                            result_str, result_num = await handle_settings_command(
+                                session, brand, cfg["access_token"], device,
+                                key, value, pre_array_ref
+                            )
+                    except Exception as e:
+                        LOGERR(f"[{did}] Command '{command_name}' error: {e}")
+                        continue
+                    result_payload = json.dumps({
+                        "command":    command_name,
+                        "result":     result_str,
+                        "result_num": result_num,
+                        "reason":     "none" if result_str == "ok" else str(result_num),
+                    })
+                    await lbmqtt.publish(f"{base_topic}/{did}/command_result", result_payload)
         except aiomqtt.MqttError as e:
             if not _shutdown_event.is_set():
                 LOGWARN(f"[{did}] LoxBerry MQTT subscriber disconnected: {e} — reconnect in 5s")
@@ -1222,7 +1224,10 @@ async def _async_main() -> None:
     brand   = BRAND_CONFIG.get(cfg.get("cloud_service", "dreame"), BRAND_CONFIG["dreame"])
 
     connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(
+        connector=connector,
+        headers={"Accept-Encoding": "gzip, deflate"},
+    ) as session:
         # Token check / login
         if not cfg.get("access_token") or time.time() >= cfg.get("expires_at", 0) - 60:
             LOGINF("No valid token — logging in")

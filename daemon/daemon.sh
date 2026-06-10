@@ -2,6 +2,7 @@
 # Dreame Gateway Daemon Wrapper
 # Called by LoxBerry with: daemon.sh start|stop|status
 
+LBHOMEDIR="${LBHOMEDIR:-/opt/loxberry}"
 PLUGINDIR="$LBHOMEDIR/config/plugins/dreame"
 LOGDIR="$LBHOMEDIR/log/plugins/dreame"
 PIDFILE="/dev/shm/dreame_gateway.pid"
