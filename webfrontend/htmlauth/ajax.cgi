@@ -13,7 +13,7 @@ my $action = $cgi->param('action') // '';
 my $folder = basename($lbpplugindir);
 
 my $pidfile = '/dev/shm/dreame_gateway.pid';
-my $daemon  = "$lbhomedir/daemon/plugins/$folder/daemon.sh";
+my $daemon  = "$lbhomedir/system/daemons/plugins/$folder";
 
 print $cgi->header(-type => 'application/json', -charset => 'utf-8');
 
@@ -31,11 +31,11 @@ if ($action eq 'getpid') {
     print encode_json({ pid => ($pid ? int($pid) : undef) });
 
 } elsif ($action eq 'start') {
-    system("bash $daemon start &");
+    system("$daemon start &");
     print encode_json({ ok => 1 });
 
 } elsif ($action eq 'stop') {
-    system("bash $daemon stop");
+    system("$daemon stop");
     print encode_json({ ok => 1 });
 
 } elsif ($action eq 'gettokenstatus') {
