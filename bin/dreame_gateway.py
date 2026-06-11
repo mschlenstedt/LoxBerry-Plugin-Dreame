@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -114,12 +115,29 @@ _MOWER_STATUS_STR = {
 _VACUUM_STATUS_STR = {
     0: "Idle", 1: "Cleaning", 2: "Returning", 3: "Charging",
     4: "Error", 5: "Paused", 6: "Sleeping",
+    7: "Cleaning", 8: "Drying", 9: "Charging",
+    10: "On Station", 11: "Charging Complete",
+    12: "Cleaning", 13: "On Station",
+    14: "Drying", 15: "On Station",
+    16: "Washing Mop", 17: "Draining",
+    18: "Collecting Dust", 19: "Washing Mop",
+}
+
+
+_MOWER_NAMED: set = {(3,1),(3,2),(3,3),(3,5),(12,1),(12,2),(2,2),(2,3)}
+_VACUUM_NAMED: set = {(4,1),(3,1),(3,2),(4,3),(4,13),(4,4),(4,5),(4,23),(4,2),(4,22),(5,1),(4,27)}
+_STATION_NAMED: set = {
+    (25,1),(25,2),(25,3),(25,4),(25,5),           # SIID 25 – older models
+    (27,1),(27,2),(27,3),(27,4),(27,5),(27,15),    # SIID 27 – newer models
 }
 
 
 def build_state_json(device: dict, props: dict) -> dict:
-    """Map siid/piid property dict → LoxBerry state JSON for this device."""
+    """Map siid/piid property dict → LoxBerry state JSON for this device.
+    Named fields are published with descriptive keys; all other numeric (siid,piid)
+    props are appended as p_<siid>_<piid> so no data is lost."""
     dt = device.get("device_type", "vacuum")
+    named = _MOWER_NAMED if dt == "mower" else _VACUUM_NAMED
     state: dict = {
         "device_type": dt,
         "name":        device.get("name", ""),
@@ -149,7 +167,6 @@ def build_state_json(device: dict, props: dict) -> dict:
             "charging":            props.get((3, 2), 0),
             "error":               props.get((4, 3), 0),
             "cleaning_time_min":   props.get((4, 13), 0),
-            "cleaned_area_m2":     props.get((4, 14), 0),
             "suction_level":       props.get((4, 4), 0),
             "water_volume":        props.get((4, 5), 0),
             "cleaning_mode":       props.get((4, 23), 0),
@@ -158,14 +175,33 @@ def build_state_json(device: dict, props: dict) -> dict:
             "dnd_enabled":         props.get((5, 1), 0),
             "child_lock":          props.get((4, 27), 0),
         })
+    # cleaned_area_m2 only when (4,14) is numeric; otherwise it flows to p_4_14 below
+    if dt != "mower":
+        v_area = props.get((4, 14))
+        if isinstance(v_area, (int, float)):
+            state["cleaned_area_m2"] = v_area
+    # Append all props not in the named set and not station props
+    for key, val in props.items():
+        if isinstance(key, tuple) and key not in named and key not in _STATION_NAMED:
+            state[f"p_{key[0]}_{key[1]}"] = val
     return state
 
 
 def build_station_json(props: dict) -> dict:
-    """Map siid 25 properties → LoxBerry state_station JSON (vacuum only)."""
-    cw = props.get((25, 1), 0)
-    dw = props.get((25, 2), 0)
-    db = props.get((25, 3), 0)
+    """Map station properties → LoxBerry state_station JSON (vacuum only).
+    SIID 25 (older models) takes priority; falls back to SIID 27 (newer models)."""
+    if (25, 1) in props:
+        cw  = props.get((25, 1), 0)
+        dw  = props.get((25, 2), 0)
+        db  = props.get((25, 3), 0)
+        det = props.get((25, 4), 0)
+        hw  = props.get((25, 5), 0)
+    else:
+        cw  = props.get((27, 1), 0)
+        dw  = props.get((27, 2), 0)
+        db  = props.get((27, 3), 0)
+        det = props.get((27, 4), 0)
+        hw  = props.get((27, 15), 0)
     cw_str = {0: "Installed", 1: "Not installed", 2: "Low water"}.get(cw, "Unknown")
     dw_str = {0: "Installed", 1: "Not installed/Full"}.get(dw, "Unknown")
     db_str = {0: "Installed", 1: "Not installed", 2: "Check"}.get(db, "Unknown")
@@ -176,8 +212,8 @@ def build_station_json(props: dict) -> dict:
         "dirty_water_tank_str": dw_str,
         "dust_bag":             db,
         "dust_bag_str":         db_str,
-        "detergent":            props.get((25, 4), 0),
-        "hot_water":            props.get((25, 5), 0),
+        "detergent":            det,
+        "hot_water":            hw,
     }
 
 
@@ -278,9 +314,11 @@ def load_plugin_config() -> dict:
     cfg.setdefault("refresh_token",        "")
     cfg.setdefault("expires_at",           0)
     cfg.setdefault("uid",                  "")
-    cfg.setdefault("base_topic",           "dreame")
-    cfg.setdefault("polling_interval_min", 30)
-    cfg.setdefault("devices",             [])
+    cfg.setdefault("uid_num",              "")
+    cfg.setdefault("base_topic",             "dreame")
+    cfg.setdefault("polling_interval_min",   30)
+    cfg.setdefault("state_poll_interval_sec", 60)
+    cfg.setdefault("devices",               [])
     return cfg
 
 
@@ -365,6 +403,17 @@ def _handle_sigterm(*_) -> None:
 
 
 # ── Dreame Auth ───────────────────────────────────────────────────────────────
+def _jwt_payload(token: str) -> dict:
+    """Decode the JWT payload (second segment) without verifying the signature."""
+    try:
+        parts = token.split(".")
+        payload = parts[1]
+        payload += "=" * (4 - len(payload) % 4)
+        return json.loads(base64.b64decode(payload))
+    except Exception:
+        return {}
+
+
 def _build_dreame_headers(brand: dict, access_token: "str | None" = None) -> dict:
     """Build required HTTP headers for Dreame cloud API calls."""
     headers = {
@@ -404,11 +453,13 @@ async def dreame_login(
         body = await resp.json(content_type=None)
     if "access_token" not in body:
         raise RuntimeError(f"Login failed: {body}")
+    jwt = _jwt_payload(body["access_token"])
     return {
         "access_token":  body["access_token"],
         "refresh_token": body.get("refresh_token", ""),
         "expires_in":    int(body.get("expires_in", 3600)),
         "uid":           str(body.get("uid", "")),
+        "uid_num":       str(jwt.get("u", "")),
     }
 
 
@@ -430,11 +481,13 @@ async def dreame_refresh_token(
         body = await resp.json(content_type=None)
     if "access_token" not in body:
         raise RuntimeError(f"Token refresh failed: {body}")
+    jwt = _jwt_payload(body["access_token"])
     return {
         "access_token":  body["access_token"],
         "refresh_token": body.get("refresh_token", refresh_token),
         "expires_in":    int(body.get("expires_in", 3600)),
         "uid":           str(body.get("uid", "")),
+        "uid_num":       str(jwt.get("u", "")),
     }
 
 
@@ -453,12 +506,12 @@ def _parse_device_list(records: list) -> list:
     for r in records:
         model = r.get("model", "")
         devices.append({
-            "did":         r.get("did", ""),
-            "model":       model,
-            "name":        r.get("customName") or model,
-            "device_type": _get_device_type(model),
-            "bind_domain": r.get("bindDomain", ""),
-            "online":      bool(r.get("online", False)),
+            "did":              r.get("did", ""),
+            "model":            model,
+            "name":             r.get("customName") or model,
+            "device_type":      _get_device_type(model),
+            "bind_domain":      r.get("bindDomain", ""),
+            "online":           bool(r.get("online", False)),
         })
     return devices
 
@@ -524,6 +577,8 @@ async def send_mower_command(
     return await send_command(session, brand, access_token, did, "action", params)
 
 
+_GET_PROPS_CHUNK = 50
+
 async def get_properties(
     session: aiohttp.ClientSession,
     brand: dict,
@@ -531,15 +586,20 @@ async def get_properties(
     did: str,
     siid_piid_list: list,
 ) -> dict:
-    """get_properties for a list of (siid, piid) pairs → {(siid, piid): value}."""
-    params = [{"did": did, "siid": s, "piid": p} for s, p in siid_piid_list]
-    result = await send_command(session, brand, access_token, did, "get_properties", params)
+    """get_properties for a list of (siid, piid) pairs → {(siid, piid): value}.
+    Batches in chunks of _GET_PROPS_CHUNK to stay within cloud API limits."""
     out = {}
-    for item in result.get("result", {}).get("data", {}).get("result", []):
-        siid = item.get("siid")
-        piid = item.get("piid")
-        if siid is not None and piid is not None and "value" in item:
-            out[(siid, piid)] = item["value"]
+    for i in range(0, len(siid_piid_list), _GET_PROPS_CHUNK):
+        chunk = siid_piid_list[i:i + _GET_PROPS_CHUNK]
+        params = [{"did": did, "siid": s, "piid": p} for s, p in chunk]
+        result = await send_command(session, brand, access_token, did, "get_properties", params)
+        if result is None:
+            continue
+        for item in (result.get("data") or {}).get("result", []):
+            siid = item.get("siid")
+            piid = item.get("piid")
+            if siid is not None and piid is not None and "value" in item:
+                out[(siid, piid)] = item["value"]
     return out
 
 
@@ -674,18 +734,26 @@ class DreameMqttClient:
         bind_domain: str,
         did: str,
         uid: str,
+        uid_num: str,
+        master_uid: str,
+        master_uid_uuid: str,
         access_token: str,
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        host_port   = bind_domain.split(":")
-        self._host  = host_port[0]
-        self._port  = int(host_port[1]) if len(host_port) > 1 else 8883
-        self._did   = did
-        self._uid   = uid
-        self._token = access_token
-        self._queue = queue
-        self._loop  = loop
+        host_port        = bind_domain.split(":")
+        self._host       = host_port[0]
+        self._port       = int(host_port[1]) if len(host_port) > 1 else 8883
+        self._did        = did
+        self._uid        = uid
+        self._uid_num    = uid_num
+        self._master_uid = master_uid
+        self._master_uid_uuid = master_uid_uuid
+        self._token      = access_token
+        self._queue      = queue
+        self._loop       = loop
+        # Map mid → topic list for subscription debugging
+        self._sub_mid_topics: dict = {}
 
         client_id    = "p_" + secrets.token_hex(8)
         self._client = paho_mqtt.Client(
@@ -704,6 +772,7 @@ class DreameMqttClient:
         self._client.on_connect    = self._on_connect
         self._client.on_message    = self._on_message
         self._client.on_disconnect = self._on_disconnect
+        self._client.on_subscribe  = self._on_subscribe
 
         self._thread: "threading.Thread | None" = None
         self._stop_flag = threading.Event()
@@ -741,13 +810,19 @@ class DreameMqttClient:
 
     def _on_message(self, client, userdata, msg) -> None:
         try:
-            payload = json.loads(msg.payload.decode("utf-8"))
+            raw = msg.payload.decode("utf-8")
+            LOGINF(f"[{self._did}] Dreame MQTT raw topic={msg.topic} payload={raw[:500]}")
+            payload = json.loads(raw)
             asyncio.run_coroutine_threadsafe(
                 self._queue.put({"did": self._did, "payload": payload}),
                 self._loop,
             )
         except Exception as e:
-            LOGWARN(f"[{self._did}] Dreame MQTT message parse error: {e}")
+            LOGWARN(f"[{self._did}] Dreame MQTT message parse error: {e} raw={msg.payload[:200]}")
+
+    def _on_subscribe(self, client, userdata, mid, granted_qos) -> None:
+        if any(q >= 128 for q in granted_qos):
+            LOGWARN(f"[{self._did}] Dreame MQTT subscription refused (qos={granted_qos})")
 
     def _on_disconnect(self, client, userdata, rc) -> None:
         if rc != 0 and not self._stop_flag.is_set():
@@ -1008,11 +1083,12 @@ async def task_dreame_to_lbmqtt(
     brand: dict,
     cfg: dict,
     mower_settings: "dict | None",
+    initial_props: "dict | None" = None,
 ) -> None:
     """Receive state updates from Dreame Cloud queue, publish to LoxBerry MQTT."""
     did = device["did"]
     dt  = device["device_type"]
-    current_props: dict = {}
+    current_props: dict = initial_props.copy() if initial_props else {}
     current_pre  : list = mower_settings.get("_pre_array", []) if mower_settings else []
 
     mqtt_kwargs = _build_mqtt_kwargs(broker)
@@ -1064,6 +1140,97 @@ async def task_dreame_to_lbmqtt(
         except Exception as e:
             LOGERR(f"[{did}] task_dreame_to_lbmqtt error: {e}")
             await asyncio.sleep(5)
+
+
+_VACUUM_POLL_PROPS = [
+    # SIID 2 – Robot Cleaner (base state, used by some models)
+    (2, 1), (2, 2),
+    # SIID 3 – Battery
+    (3, 1), (3, 2), (3, 3),
+    # SIID 4 – Vacuum Extend (core status + settings)
+    (4, 1),  (4, 2),  (4, 3),  (4, 4),  (4, 5),  (4, 6),  (4, 7),
+    (4, 11), (4, 12), (4, 13), (4, 14),
+    (4, 16), (4, 17), (4, 18), (4, 19), (4, 20),
+    (4, 21), (4, 22), (4, 23), (4, 24), (4, 25), (4, 26), (4, 27), (4, 28), (4, 29),
+    (4, 33), (4, 34), (4, 35), (4, 36), (4, 37),
+    (4, 40), (4, 41), (4, 45), (4, 46), (4, 47), (4, 48), (4, 49), (4, 50),
+    (4, 51), (4, 52), (4, 53), (4, 58), (4, 60), (4, 63), (4, 64), (4, 83),
+    # SIID 5 – DND
+    (5, 1), (5, 2), (5, 3), (5, 4),
+    # SIID 7 – Volume
+    (7, 1),
+    # SIID 9 – Main Brush
+    (9, 1), (9, 2),
+    # SIID 10 – Side Brush
+    (10, 1), (10, 2),
+    # SIID 11 – Filter
+    (11, 1), (11, 2),
+    # SIID 12 – Statistics
+    (12, 1), (12, 2), (12, 3), (12, 4), (12, 5), (12, 6),
+    # SIID 15 – Auto Empty
+    (15, 1), (15, 2), (15, 3), (15, 5),
+    # SIID 16 – Sensor
+    (16, 1), (16, 2),
+    # SIID 25 – Station status (older models)
+    (25, 1), (25, 2), (25, 3), (25, 4), (25, 5),
+    # SIID 27 – Station status (newer models)
+    (27, 1), (27, 2), (27, 3), (27, 4), (27, 5), (27, 15),
+    # SIID 28 – Extended Settings
+    (28, 1),  (28, 2),  (28, 3),  (28, 4),  (28, 5),  (28, 8),
+    (28, 14), (28, 15), (28, 16), (28, 18), (28, 22),
+    (28, 27), (28, 28), (28, 29), (28, 52),
+    # SIID 30 – Wheel
+    (30, 1), (30, 2),
+]
+_MOWER_POLL_PROPS = [
+    (3, 1), (3, 2), (3, 3), (3, 5),
+    (12, 1), (12, 2), (2, 2), (2, 3),
+]
+
+
+async def task_state_poll(
+    device: dict,
+    broker: dict,
+    base_topic: str,
+    session: aiohttp.ClientSession,
+    brand: dict,
+    cfg: dict,
+    mower_settings: "dict | None",
+    initial_props: "dict | None" = None,
+) -> None:
+    """Poll Dreame cloud for state changes and publish to LoxBerry MQTT."""
+    did = device["did"]
+    dt  = device["device_type"]
+    current_props: dict = initial_props.copy() if initial_props else {}
+    poll_props = _VACUUM_POLL_PROPS if dt == "vacuum" else _MOWER_POLL_PROPS
+    mqtt_kwargs = _build_mqtt_kwargs(broker)
+
+    while not _shutdown_event.is_set():
+        interval = int(cfg.get("state_poll_interval_sec", 60))
+        await asyncio.sleep(interval)
+        if _shutdown_event.is_set():
+            break
+        try:
+            new_props = await get_properties(session, brand, cfg["access_token"], did, poll_props)
+            if not new_props:
+                continue
+            changed = {k: v for k, v in new_props.items() if current_props.get(k) != v}
+            if not changed:
+                continue
+            current_props.update(new_props)
+            state = build_state_json(device, current_props)
+            if dt == "mower" and mower_settings:
+                state.update({k: v for k, v in mower_settings.items() if not k.startswith("_")})
+            async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
+                await lbmqtt.publish(f"{base_topic}/{did}/state", json.dumps(state), retain=True)
+                if dt == "vacuum":
+                    station = build_station_json(current_props)
+                    await lbmqtt.publish(
+                        f"{base_topic}/{did}/state_station", json.dumps(station), retain=True
+                    )
+            LOGINF(f"[{did}] State polled: {len(changed)} props changed")
+        except Exception as e:
+            LOGERR(f"[{did}] State poll error: {e}")
 
 
 async def task_lbmqtt_to_dreame(
@@ -1149,6 +1316,7 @@ async def task_token_refresh(
                 tokens = await dreame_refresh_token(session, brand, cfg["refresh_token"])
                 cfg["access_token"]  = tokens["access_token"]
                 cfg["refresh_token"] = tokens["refresh_token"]
+                cfg["uid_num"]       = tokens.get("uid_num", "")
                 cfg["expires_at"]    = time.time() + tokens["expires_in"]
                 save_plugin_config(cfg)
                 LOGOK("Token refreshed successfully")
@@ -1162,6 +1330,7 @@ async def task_token_refresh(
                     cfg["access_token"]  = tokens["access_token"]
                     cfg["refresh_token"] = tokens["refresh_token"]
                     cfg["uid"]           = tokens["uid"]
+                    cfg["uid_num"]       = tokens.get("uid_num", "")
                     cfg["expires_at"]    = time.time() + tokens["expires_in"]
                     save_plugin_config(cfg)
                     LOGOK("Re-login successful")
@@ -1239,6 +1408,7 @@ async def _async_main() -> None:
             cfg["access_token"]  = tokens["access_token"]
             cfg["refresh_token"] = tokens["refresh_token"]
             cfg["uid"]           = tokens["uid"]
+            cfg["uid_num"]       = tokens.get("uid_num", "")
             cfg["expires_at"]    = time.time() + tokens["expires_in"]
             save_plugin_config(cfg)
 
@@ -1257,16 +1427,12 @@ async def _async_main() -> None:
             return
 
         cfg_lock   = asyncio.Lock()
-        loop       = asyncio.get_running_loop()
         base_topic = cfg.get("base_topic", "dreame")
 
-        tasks_coro  = []
-        dreame_clients = []
+        tasks_coro = []
 
         for device in devices:
-            did  = device["did"]
-            bind = device.get("bind_domain", "")
-            queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+            did = device["did"]
 
             # Mower: load settings at startup
             mower_settings = None
@@ -1281,32 +1447,32 @@ async def _async_main() -> None:
                 except Exception as e:
                     LOGWARN(f"[{did}] Mower settings error: {e}")
 
-            # Vacuum: load station properties at startup
-            if device["device_type"] == "vacuum" and bind:
-                try:
-                    station_props = await get_properties(
-                        session, brand, cfg["access_token"], did,
-                        [(25, 1), (25, 2), (25, 3), (25, 4), (25, 5)]
-                    )
-                    mqtt_kwargs = _build_mqtt_kwargs(broker)
-                    async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
-                        station = build_station_json(station_props)
+            # Fetch all initial properties and publish state + state_station
+            initial_props: "dict | None" = None
+            try:
+                poll_props = _VACUUM_POLL_PROPS if device["device_type"] == "vacuum" else _MOWER_POLL_PROPS
+                initial_props = await get_properties(
+                    session, brand, cfg["access_token"], did, poll_props
+                )
+                LOGOK(f"[{did}] Initial props loaded: {len(initial_props)} values")
+                mqtt_kwargs = _build_mqtt_kwargs(broker)
+                async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
+                    state = build_state_json(device, initial_props)
+                    if mower_settings:
+                        state.update({k: v for k, v in mower_settings.items() if not k.startswith("_")})
+                    await lbmqtt.publish(f"{base_topic}/{did}/state", json.dumps(state), retain=True)
+                    if device["device_type"] == "vacuum":
+                        station = build_station_json(initial_props)
                         await lbmqtt.publish(
-                            f"{base_topic}/{did}/state_station",
-                            json.dumps(station),
-                            retain=True,
+                            f"{base_topic}/{did}/state_station", json.dumps(station), retain=True
                         )
-                except Exception as e:
-                    LOGWARN(f"[{did}] Station props error: {e}")
+            except Exception as e:
+                LOGWARN(f"[{did}] Initial props error: {e}")
 
-            # Start Dreame cloud MQTT (only if device has a bind_domain)
-            if bind:
-                dc = DreameMqttClient(bind, did, cfg["uid"], cfg["access_token"], queue, loop)
-                dc.start()
-                dreame_clients.append(dc)
-                tasks_coro.append(task_dreame_to_lbmqtt(
-                    device, queue, broker, base_topic, session, brand, cfg, mower_settings
-                ))
+            tasks_coro.append(task_state_poll(
+                device, broker, base_topic, session, brand, cfg,
+                mower_settings, initial_props
+            ))
             tasks_coro.append(task_lbmqtt_to_dreame(
                 device, broker, base_topic, session, brand, cfg, pre_array_ref
             ))
@@ -1317,8 +1483,6 @@ async def _async_main() -> None:
         all_tasks = [asyncio.create_task(c) for c in tasks_coro]
         await _shutdown_event.wait()
 
-        for dc in dreame_clients:
-            dc.stop()
         for t in all_tasks:
             t.cancel()
         await asyncio.gather(*all_tasks, return_exceptions=True)
