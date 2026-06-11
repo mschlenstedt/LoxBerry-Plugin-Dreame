@@ -131,6 +131,47 @@ _STATION_NAMED: set = {
     (27,1),(27,2),(27,3),(27,4),(27,5),(27,15),    # SIID 27 – newer models
 }
 
+# ── Curated property names (A) ────────────────────────────────────────────────
+# High-confidence (siid, piid) → name map for props that are NOT already published
+# with a descriptive key (i.e. not in *_NAMED / _STATION_NAMED). Sourced from
+# python-miio, Tasshack/dreame-vacuum and the plugin's own VACUUM_SETTINGS /
+# load_statistic mappings. Anything not covered here falls through to the MIoT
+# spec lookup (B) and finally to p_<siid>_<piid> so no value is ever lost.
+_VACUUM_PROP_NAMES: dict = {
+    (4, 6):  "mop_attached",            (4, 12): "carpet_boost",
+    (4, 28): "carpet_sensitivity",      (4, 33): "carpet_recognition",
+    (4, 36): "carpet_cleaning",         (4, 37): "auto_add_detergent",
+    (4, 40): "drying_time",             (4, 46): "mop_wash_level",
+    (4, 51): "auto_water_refilling",
+    (5, 2):  "dnd_start",               (5, 3):  "dnd_end",
+    (5, 4):  "dnd_schedule",
+    (7, 1):  "volume",
+    (9, 1):  "main_brush_left_pct",     (9, 2):  "main_brush_time_left_h",
+    (10, 1): "side_brush_left_pct",     (10, 2): "side_brush_time_left_h",
+    (11, 1): "filter_left_pct",         (11, 2): "filter_time_left_h",
+    (12, 1): "first_cleaning_date",     (12, 2): "total_cleaning_time_min",
+    (12, 3): "cleaning_count",          (12, 4): "total_cleaned_area_m2",
+    (15, 1): "auto_dust_collecting",    (15, 2): "auto_empty_frequency",
+    (15, 3): "dust_collection",         (15, 5): "auto_empty_status",
+    (16, 1): "sensor_dirty_left_pct",   (16, 2): "sensor_dirty_time_left_h",
+    (18, 1): "mop_pad_left_pct",        (18, 2): "mop_pad_time_left_h",
+    (28, 1): "wetness_level",           (28, 8): "water_temperature",
+    (28, 27): "silent_drying",          (28, 28): "hair_compression",
+    (30, 1): "wheel_dirty_left_pct",    (30, 2): "wheel_dirty_time_left_h",
+}
+_MOWER_PROP_NAMES: dict = {
+    (12, 3): "total_mow_count",         (12, 4): "total_mow_area_m2",
+}
+
+# ── MIoT spec lookup cache (B) ────────────────────────────────────────────────
+# Filled at startup by ensure_prop_names() per model: {model: {(siid,piid): name}}.
+# Used only for props that A did not already cover.
+_SPEC_PROP_NAMES: dict = {}
+
+
+def _prop_name_map(dt: str) -> dict:
+    return _MOWER_PROP_NAMES if dt == "mower" else _VACUUM_PROP_NAMES
+
 
 def build_state_json(device: dict, props: dict) -> dict:
     """Map siid/piid property dict → LoxBerry state JSON for this device.
@@ -180,9 +221,18 @@ def build_state_json(device: dict, props: dict) -> dict:
         v_area = props.get((4, 14))
         if isinstance(v_area, (int, float)):
             state["cleaned_area_m2"] = v_area
-    # Append all props not in the named set and not station props
+    # Append remaining props: name them via the curated map (A) or the resolved
+    # MIoT spec (B); anything still unknown — or a name collision — stays as
+    # p_<siid>_<piid> so no value is lost.
+    name_map = _prop_name_map(dt)
+    spec_map = _SPEC_PROP_NAMES.get(device.get("model", ""), {})
     for key, val in props.items():
-        if isinstance(key, tuple) and key not in named and key not in _STATION_NAMED:
+        if not (isinstance(key, tuple) and key not in named and key not in _STATION_NAMED):
+            continue
+        nm = name_map.get(key) or spec_map.get(key)
+        if nm and nm not in state:
+            state[nm] = val
+        else:
             state[f"p_{key[0]}_{key[1]}"] = val
     return state
 
@@ -649,6 +699,135 @@ async def get_properties(
             if siid is not None and piid is not None and "value" in item:
                 out[(siid, piid)] = item["value"]
     return out
+
+
+# ── MIoT spec resolution (B) ──────────────────────────────────────────────────
+# Public Xiaomi MIoT spec registry. Newer Dreame "Gen 2" devices (e.g.
+# dreame.vacuum.r2469a) are NOT published there — the lookup then yields nothing
+# and the affected props simply stay as p_<siid>_<piid>.
+_MIOT_INSTANCES_URL = "https://miot-spec.org/miot-spec-v2/instances?status=all"
+_MIOT_INSTANCE_URL  = "https://miot-spec.org/miot-spec-v2/instance?type={urn}"
+_MIOT_TIMEOUT       = aiohttp.ClientTimeout(total=30)
+
+
+def _slugify(text: str) -> str:
+    """'Main Brush Left Time' → 'main_brush_left_time'."""
+    s = re.sub(r"[^a-z0-9]+", "_", text.strip().lower())
+    return s.strip("_")
+
+
+def _spec_cache_file(model: str) -> Path:
+    return CONFIGDIR / "specs" / f"{re.sub(r'[^A-Za-z0-9._-]', '_', model)}.json"
+
+
+def _load_spec_cache(model: str) -> "dict | None":
+    """Return cached {(siid,piid): name} for the model, or None if never resolved.
+    An (intentionally) empty dict means 'resolved but nothing found' → no refetch."""
+    f = _spec_cache_file(model)
+    if not f.is_file():
+        return None
+    raw = _load_json(f)
+    out: dict = {}
+    for k, v in raw.items():
+        try:
+            s, p = k.split("_")
+            out[(int(s), int(p))] = v
+        except Exception:
+            continue
+    return out
+
+
+def _save_spec_cache(model: str, names: dict) -> None:
+    f = _spec_cache_file(model)
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        serial = {f"{s}_{p}": n for (s, p), n in names.items()}
+        _save_json_atomic(f, serial)
+    except Exception as e:
+        LOGWARN(f"Cannot write spec cache {f}: {e}")
+
+
+async def _resolve_miot_urn(session: aiohttp.ClientSession, model: str) -> "str | None":
+    """Find the newest MIoT spec URN for a model from the public instances list."""
+    async with session.get(_MIOT_INSTANCES_URL, timeout=_MIOT_TIMEOUT) as resp:
+        resp.raise_for_status()
+        data = await resp.json(content_type=None)
+    best_urn, best_ver = None, -1
+    for inst in data.get("instances", []):
+        if inst.get("model") != model:
+            continue
+        urn = inst.get("type", "")
+        try:
+            ver = int(urn.rsplit(":", 1)[-1])
+        except Exception:
+            ver = 0
+        if ver > best_ver:
+            best_urn, best_ver = urn, ver
+    return best_urn
+
+
+async def _fetch_miot_spec_names(session: aiohttp.ClientSession, urn: str) -> dict:
+    """Fetch a MIoT instance spec → {(siid,piid): slugified-property-name}."""
+    url = _MIOT_INSTANCE_URL.format(urn=urn)
+    async with session.get(url, timeout=_MIOT_TIMEOUT) as resp:
+        resp.raise_for_status()
+        spec = await resp.json(content_type=None)
+    names: dict = {}
+    for svc in spec.get("services", []):
+        siid = svc.get("iid")
+        for prop in svc.get("properties", []):
+            piid = prop.get("iid")
+            desc = prop.get("description") or prop.get("name") or ""
+            slug = _slugify(desc)
+            if siid is not None and piid is not None and slug:
+                names[(siid, piid)] = slug
+    return names
+
+
+async def ensure_prop_names(
+    session: aiohttp.ClientSession,
+    device: dict,
+    props: dict,
+) -> None:
+    """Resolve names for a device's properties. D+A are static; B (MIoT spec) is
+    only queried when A leaves unknown props, and its result is cached per model.
+    On any failure the unknown props remain p_<siid>_<piid> (never lost)."""
+    model = device.get("model", "")
+    if not model or model in _SPEC_PROP_NAMES:
+        return
+
+    cached = _load_spec_cache(model)
+    if cached is not None:
+        _SPEC_PROP_NAMES[model] = cached
+        return
+
+    dt       = device.get("device_type", "vacuum")
+    named    = _MOWER_NAMED if dt == "mower" else _VACUUM_NAMED
+    curated  = _prop_name_map(dt)
+    unknown  = [
+        k for k in props
+        if isinstance(k, tuple) and isinstance(k[0], int)
+        and k not in named and k not in _STATION_NAMED and k not in curated
+    ]
+    if not unknown:
+        return  # D+A already cover everything — no spec lookup needed
+
+    names: dict = {}
+    try:
+        urn = await _resolve_miot_urn(session, model)
+        if urn:
+            names = await _fetch_miot_spec_names(session, urn)
+            LOGOK(f"[{device.get('did','')}] MIoT spec resolved for {model}: "
+                  f"{len(names)} names ({len(unknown)} props were unknown)")
+        else:
+            LOGINF(f"[{device.get('did','')}] {model} not in MIoT registry — "
+                   f"{len(unknown)} props stay as p_x_y")
+    except Exception as e:
+        LOGWARN(f"[{device.get('did','')}] MIoT spec lookup failed ({e}) — "
+                f"{len(unknown)} props stay as p_x_y")
+
+    _SPEC_PROP_NAMES[model] = names
+    _save_spec_cache(model, names)
 
 
 async def load_mower_settings(
@@ -1536,6 +1715,9 @@ async def _async_main() -> None:
                     session, brand, cfg["access_token"], did, poll_props
                 )
                 LOGOK(f"[{did}] Initial props loaded: {len(initial_props)} values")
+                # Resolve property names (D+A static, B = MIoT spec only if needed)
+                # before the first publish so state keys are descriptive from the start.
+                await ensure_prop_names(session, device, initial_props)
                 mqtt_kwargs = _build_mqtt_kwargs(broker)
                 async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
                     state = build_state_json(device, initial_props)
