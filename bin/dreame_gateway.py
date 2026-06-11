@@ -325,6 +325,11 @@ def load_plugin_config() -> dict:
     if "password_hash" in cfg:
         del cfg["password_hash"]
         dirty = True
+    if "polling_interval_min" in cfg:
+        cfg.setdefault("statistic_poll_interval_sec",
+                       int(cfg["polling_interval_min"]) * 60)
+        del cfg["polling_interval_min"]
+        dirty = True
     if any(k in cfg for k in _EPHEMERAL_FIELDS):
         for k in _EPHEMERAL_FIELDS:
             cfg.pop(k, None)
@@ -335,9 +340,9 @@ def load_plugin_config() -> dict:
     cfg.setdefault("username",                "")
     cfg.setdefault("password_plain",          "")
     cfg.setdefault("refresh_token",           "")
-    cfg.setdefault("base_topic",              "dreame")
-    cfg.setdefault("polling_interval_min",    30)
-    cfg.setdefault("state_poll_interval_sec", 60)
+    cfg.setdefault("base_topic",                  "dreame")
+    cfg.setdefault("statistic_poll_interval_sec", 1800)
+    cfg.setdefault("state_poll_interval_sec",     60)
     cfg.setdefault("devices",                 [])
     # Ephemeral — memory only, populated by the startup refresh/login below.
     cfg["access_token"] = ""
@@ -1398,8 +1403,8 @@ async def task_statistic_poll(
     broker: dict,
     base_topic: str,
 ) -> None:
-    """Poll statistics/consumables periodically (default 30 min)."""
-    interval = int(cfg.get("polling_interval_min", 30)) * 60
+    """Poll statistics/consumables periodically (default 1800 s = 30 min)."""
+    interval = int(cfg.get("statistic_poll_interval_sec", 1800))
     while not _shutdown_event.is_set():
         await asyncio.sleep(interval)
         for device in devices:

@@ -19,12 +19,13 @@ my $folder  = basename($lbpplugindir);
 my $jsonobj = LoxBerry::JSON->new();
 my $cfg = $jsonobj->open(filename => "$lbpconfigdir/pluginconfig.json");
 $cfg //= {};
-$cfg->{cloud_service}           //= 'dreame';
-$cfg->{username}                //= '';
-$cfg->{base_topic}              //= 'dreame';
-$cfg->{polling_interval_min}    //= 30;
-$cfg->{state_poll_interval_sec} //= 60;
-$cfg->{devices}                 //= [];
+$cfg->{cloud_service}              //= 'dreame';
+$cfg->{username}                   //= '';
+$cfg->{password_plain}             //= '';
+$cfg->{base_topic}                 //= 'dreame';
+$cfg->{statistic_poll_interval_sec} //= 1800;
+$cfg->{state_poll_interval_sec}    //= 60;
+$cfg->{devices}                    //= [];
 
 # Active tab (default: gateway)
 my $form = $q->{form} // 'gateway';
@@ -36,14 +37,15 @@ my $save_msg = '';
 my $action   = $q->{action} // '';
 
 if ($action eq 'save_config') {
-    $cfg->{cloud_service}           = $q->{cloud_service}        || 'dreame';
-    $cfg->{username}                = $q->{username}             || '';
-    $cfg->{base_topic}              = $q->{base_topic}           || 'dreame';
-    $cfg->{polling_interval_min}    = int($q->{polling_interval_min} || 30);
-    $cfg->{state_poll_interval_sec} = int($q->{state_poll_interval_sec} || 60);
-    if ($q->{password}) {
-        # New password: store plain (gateway needs it for login) and drop the
-        # persisted refresh_token so the next start does a fresh login.
+    $cfg->{cloud_service}               = $q->{cloud_service}        || 'dreame';
+    $cfg->{username}                    = $q->{username}             || '';
+    $cfg->{base_topic}                  = $q->{base_topic}           || 'dreame';
+    $cfg->{statistic_poll_interval_sec} = int($q->{statistic_poll_interval_sec} || 1800);
+    $cfg->{state_poll_interval_sec}     = int($q->{state_poll_interval_sec} || 60);
+    # The password field is pre-filled, so it is sent on every save. Only act
+    # when it actually changed: store the new plain password and drop the
+    # persisted refresh_token so the next start does a fresh login.
+    if (defined $q->{password} && $q->{password} ne ($cfg->{password_plain} // '')) {
         $cfg->{password_plain} = $q->{password};
         $cfg->{refresh_token}  = '';
     }
@@ -96,9 +98,10 @@ if ($form eq 'gateway') {
     $tmpl->param(CLOUD_SERVICE        => $cfg->{cloud_service});
     $tmpl->param(IS_DREAME            => $cfg->{cloud_service} eq 'dreame' ? 1 : 0);
     $tmpl->param(IS_MOVA              => $cfg->{cloud_service} eq 'mova'   ? 1 : 0);
-    $tmpl->param(USERNAME             => CGI::escapeHTML($cfg->{username}));
+    $tmpl->param(USERNAME                => CGI::escapeHTML($cfg->{username}));
+    $tmpl->param(PASSWORD                => CGI::escapeHTML($cfg->{password_plain} // ''));
     $tmpl->param(BASE_TOPIC              => CGI::escapeHTML($cfg->{base_topic}));
-    $tmpl->param(POLLING_INTERVAL_MIN    => int($cfg->{polling_interval_min}));
+    $tmpl->param(STATISTIC_POLL_INTERVAL_SEC => int($cfg->{statistic_poll_interval_sec}));
     $tmpl->param(STATE_POLL_INTERVAL_SEC => int($cfg->{state_poll_interval_sec}));
     $tmpl->param(SAVE_OK                 => $save_ok);
     $tmpl->param(SAVE_MSG             => $save_msg);

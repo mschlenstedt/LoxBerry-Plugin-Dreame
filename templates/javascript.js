@@ -27,6 +27,18 @@ function updateGatewayStatus() {
         });
 }
 
+// After a restart the new gateway needs a few seconds to authenticate and
+// publish its auth status — poll the token box so it updates without a reload.
+function _refreshTokenAfterRestart() {
+    let attempts = 0;
+    updateTokenStatus();
+    const poll = setInterval(() => {
+        attempts++;
+        updateTokenStatus();
+        if (attempts >= 8) clearInterval(poll);   // ~24s, poll every 3s
+    }, 3000);
+}
+
 function _pollNewPid(oldPid) {
     let attempts = 0;
     const poll = setInterval(() => {
@@ -95,11 +107,14 @@ if (btnRestart) {
                         el.textContent = 'Fehler: ' + data.error;
                         el.style.cssText = _GW_STYLE + 'background:#f5a623;color:black;';
                     }
-                } else if (data.pid && data.pid !== oldPid) {
+                    return;
+                }
+                if (data.pid && data.pid !== oldPid) {
                     updateGatewayStatus();
                 } else {
                     _pollNewPid(oldPid);
                 }
+                _refreshTokenAfterRestart();
             })
             .catch(() => { btn.classList.remove('lb-btn-loading'); updateGatewayStatus(); });
     });
@@ -112,6 +127,22 @@ if (btnStop) {
         fetch('ajax.cgi?action=stop')
             .then(() => updateGatewayStatus())
             .catch(() => {});
+    });
+}
+
+// Config tab: show/hide password toggle (eye button next to the field)
+const btnShowPass = document.getElementById('showpass');
+if (btnShowPass) {
+    btnShowPass.addEventListener('click', function() {
+        const inp = document.getElementById('password');
+        if (!inp) return;
+        if (inp.type === 'password') {
+            inp.type = 'text';
+            this.innerHTML = '<i class="pi pi-eye-slash"></i>';
+        } else {
+            inp.type = 'password';
+            this.innerHTML = '<i class="pi pi-eye"></i>';
+        }
     });
 }
 

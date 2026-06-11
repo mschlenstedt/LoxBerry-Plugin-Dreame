@@ -28,11 +28,12 @@
 
 <div class="lb-form-row">
   <label class="lb-form-label" for="password">Passwort</label>
-  <div class="lb-form-field">
-    <input class="lb-input" type="password" name="password" id="password">
+  <div class="lb-form-field" style="display:flex;gap:6px;align-items:center">
+    <input class="lb-input" type="password" name="password" id="password" value="<TMPL_VAR PASSWORD>" style="flex:1;min-width:0">
+    <button id="showpass" name="showpass" type="button" class="lb-btn lb-btn-sm lb-btn-icon" style="flex-shrink:0"><i class="pi pi-eye"></i></button>
   </div>
 </div>
-<div class="lb-form-help hint">Das Passwort wird einmalig für den Login in die Dreame/MOVA Cloud verwendet. Leer lassen, wenn bereits eingeloggt.</div>
+<div class="lb-form-help hint">Passwort für den Login in die Dreame/MOVA Cloud. Wird das Passwort geändert, meldet sich das Gateway beim nächsten Start neu an.</div>
 
 <div class="lb-section-title" style="margin-top:2rem;">MQTT</div>
 
@@ -53,12 +54,12 @@
 <div class="lb-form-help hint">Wie oft der Live-Status (Akku, Status, Fehler) aus der Cloud gepollt wird.</div>
 
 <div class="lb-form-row">
-  <label class="lb-form-label" for="polling_interval_min">Statistik-Intervall (min)</label>
+  <label class="lb-form-label" for="statistic_poll_interval_sec">Statistik-Intervall (Sek.)</label>
   <div class="lb-form-field">
-    <input class="lb-input" type="number" name="polling_interval_min" id="polling_interval_min" value="<TMPL_VAR POLLING_INTERVAL_MIN>" min="5" max="1440">
+    <input class="lb-input" type="number" name="statistic_poll_interval_sec" id="statistic_poll_interval_sec" value="<TMPL_VAR STATISTIC_POLL_INTERVAL_SEC>" min="60" max="86400">
   </div>
 </div>
-<div class="lb-form-help hint">Wie oft Statistik-/Verschleißdaten (Reinigungszeit, Bürsten, Mäh-Historie) gepollt werden.</div>
+<div class="lb-form-help hint">Wie oft Statistik-/Verschleißdaten (Reinigungszeit, Bürsten, Mäh-Historie) gepollt werden, z.B. 1800 = alle 30 Min.</div>
 
 <div style="margin-top:1.5rem;">
   <button type="submit" class="lb-btn lb-btn-primary lb-btn-icon"><i class="pi pi-save"></i> Speichern</button>
