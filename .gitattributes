@@ -1,0 +1,11 @@
+# Plugin runs on LoxBerry (Linux): all text files must keep LF line endings,
+# regardless of the editing OS. Prevents CRLF from breaking shell/perl/python/cgi.
+* text=auto eol=lf
+
+# Binary files: never touch
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.svg  text eol=lf
+*.ico  binary

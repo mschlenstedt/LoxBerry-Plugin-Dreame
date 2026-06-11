@@ -81,3 +81,11 @@ Nach dem Vorbild des Navimow-Plugins umgesetzt. **Source of Truth** für „soll
 
 - **Kein separater „Start"-Button**: Navimow-Modell kennt nur Restart (= Flag löschen + starten) und Stop (= Flag setzen + killen). Restart ist auch der Weg, einen gestoppten Gateway wieder hochzufahren.
 - Wer den Boot-Start ändert, muss den Flag-Check im `start`-Case von `daemon.sh` beibehalten — sonst startet ein gestoppter Gateway beim Reboot wieder.
+
+## Zeilenenden (LF) — `.gitattributes`
+
+Das Plugin läuft auf LoxBerry (Linux). Alle Textdateien **müssen LF** behalten — CRLF bricht Shell-Scripts (`daemon.sh`), Perl-CGIs (`ajax.cgi`, `index.cgi`) und Python (Shebang-Zeile). Beim Editieren unter Windows wandelt Git sonst auf CRLF.
+
+- `.gitattributes` erzwingt `* text=auto eol=lf` → im Repo **und** im Checkout immer LF, unabhängig vom Editier-OS.
+- Die Warnung `LF will be replaced by CRLF the next time Git touches it` ist damit erledigt.
+- Nach Änderungen an `.gitattributes` einmal `git add --renormalize .` ausführen, damit bereits getrackte Dateien angeglichen werden.
