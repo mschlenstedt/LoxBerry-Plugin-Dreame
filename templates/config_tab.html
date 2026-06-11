@@ -45,11 +45,20 @@
 <div class="lb-form-help hint">Alle MQTT-Topics beginnen mit diesem Prefix, z.B. <code>dreame/&lt;did&gt;/state</code></div>
 
 <div class="lb-form-row">
+  <label class="lb-form-label" for="state_poll_interval_sec">Live-Status-Intervall (Sek.)</label>
+  <div class="lb-form-field">
+    <input class="lb-input" type="number" name="state_poll_interval_sec" id="state_poll_interval_sec" value="<TMPL_VAR STATE_POLL_INTERVAL_SEC>" min="10" max="3600">
+  </div>
+</div>
+<div class="lb-form-help hint">Wie oft der Live-Status (Akku, Status, Fehler) aus der Cloud gepollt wird.</div>
+
+<div class="lb-form-row">
   <label class="lb-form-label" for="polling_interval_min">Statistik-Intervall (min)</label>
   <div class="lb-form-field">
     <input class="lb-input" type="number" name="polling_interval_min" id="polling_interval_min" value="<TMPL_VAR POLLING_INTERVAL_MIN>" min="5" max="1440">
   </div>
 </div>
+<div class="lb-form-help hint">Wie oft Statistik-/Verschleißdaten (Reinigungszeit, Bürsten, Mäh-Historie) gepollt werden.</div>
 
 <div style="margin-top:1.5rem;">
   <button type="submit" class="lb-btn lb-btn-primary lb-btn-icon"><i class="pi pi-save"></i> Speichern</button>

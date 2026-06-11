@@ -19,14 +19,12 @@ my $folder  = basename($lbpplugindir);
 my $jsonobj = LoxBerry::JSON->new();
 my $cfg = $jsonobj->open(filename => "$lbpconfigdir/pluginconfig.json");
 $cfg //= {};
-$cfg->{cloud_service}        //= 'dreame';
-$cfg->{username}             //= '';
-$cfg->{base_topic}           //= 'dreame';
-$cfg->{polling_interval_min} //= 30;
-$cfg->{devices}              //= [];
-$cfg->{access_token}         //= '';
-$cfg->{refresh_token}        //= '';
-$cfg->{expires_at}           //= 0;
+$cfg->{cloud_service}           //= 'dreame';
+$cfg->{username}                //= '';
+$cfg->{base_topic}              //= 'dreame';
+$cfg->{polling_interval_min}    //= 30;
+$cfg->{state_poll_interval_sec} //= 60;
+$cfg->{devices}                 //= [];
 
 # Active tab (default: gateway)
 my $form = $q->{form} // 'gateway';
@@ -38,15 +36,16 @@ my $save_msg = '';
 my $action   = $q->{action} // '';
 
 if ($action eq 'save_config') {
-    $cfg->{cloud_service}        = $q->{cloud_service}        || 'dreame';
-    $cfg->{username}             = $q->{username}             || '';
-    $cfg->{base_topic}           = $q->{base_topic}           || 'dreame';
-    $cfg->{polling_interval_min} = int($q->{polling_interval_min} || 30);
+    $cfg->{cloud_service}           = $q->{cloud_service}        || 'dreame';
+    $cfg->{username}                = $q->{username}             || '';
+    $cfg->{base_topic}              = $q->{base_topic}           || 'dreame';
+    $cfg->{polling_interval_min}    = int($q->{polling_interval_min} || 30);
+    $cfg->{state_poll_interval_sec} = int($q->{state_poll_interval_sec} || 60);
     if ($q->{password}) {
-        $cfg->{_password_plain} = $q->{password};
-        $cfg->{access_token}    = '';
-        $cfg->{refresh_token}   = '';
-        $cfg->{expires_at}      = 0;
+        # New password: store plain (gateway needs it for login) and drop the
+        # persisted refresh_token so the next start does a fresh login.
+        $cfg->{password_plain} = $q->{password};
+        $cfg->{refresh_token}  = '';
     }
     $jsonobj->write();
     $save_ok  = 1;
@@ -98,9 +97,10 @@ if ($form eq 'gateway') {
     $tmpl->param(IS_DREAME            => $cfg->{cloud_service} eq 'dreame' ? 1 : 0);
     $tmpl->param(IS_MOVA              => $cfg->{cloud_service} eq 'mova'   ? 1 : 0);
     $tmpl->param(USERNAME             => CGI::escapeHTML($cfg->{username}));
-    $tmpl->param(BASE_TOPIC           => CGI::escapeHTML($cfg->{base_topic}));
-    $tmpl->param(POLLING_INTERVAL_MIN => int($cfg->{polling_interval_min}));
-    $tmpl->param(SAVE_OK              => $save_ok);
+    $tmpl->param(BASE_TOPIC              => CGI::escapeHTML($cfg->{base_topic}));
+    $tmpl->param(POLLING_INTERVAL_MIN    => int($cfg->{polling_interval_min}));
+    $tmpl->param(STATE_POLL_INTERVAL_SEC => int($cfg->{state_poll_interval_sec}));
+    $tmpl->param(SAVE_OK                 => $save_ok);
     $tmpl->param(SAVE_MSG             => $save_msg);
 
 } elsif ($form eq 'log') {

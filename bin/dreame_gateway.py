@@ -305,25 +305,68 @@ def _save_json_atomic(path: Path, data: dict) -> None:
         LOGERR(f"Cannot write {path}: {e}")
 
 
+# These fields live in memory only and are NEVER written to the SD card.
+# They are re-obtained at startup via token refresh / login, so persisting them
+# would only cause needless write wear (token refresh happens ~hourly).
+_EPHEMERAL_FIELDS = frozenset(("access_token", "expires_at", "uid", "uid_num"))
+
+
 def load_plugin_config() -> dict:
     cfg = _load_json(PLUGIN_CFG)
-    cfg.setdefault("cloud_service",        "dreame")
-    cfg.setdefault("username",             "")
-    cfg.setdefault("password_hash",        "")
-    cfg.setdefault("access_token",         "")
-    cfg.setdefault("refresh_token",        "")
-    cfg.setdefault("expires_at",           0)
-    cfg.setdefault("uid",                  "")
-    cfg.setdefault("uid_num",              "")
-    cfg.setdefault("base_topic",             "dreame")
-    cfg.setdefault("polling_interval_min",   30)
+    # One-time migration of configs written by older plugin versions:
+    #   - rename _password_plain → password_plain
+    #   - drop the now-unused password_hash
+    #   - strip ephemeral fields that used to be persisted
+    dirty = False
+    if "_password_plain" in cfg:
+        cfg.setdefault("password_plain", cfg["_password_plain"])
+        del cfg["_password_plain"]
+        dirty = True
+    if "password_hash" in cfg:
+        del cfg["password_hash"]
+        dirty = True
+    if any(k in cfg for k in _EPHEMERAL_FIELDS):
+        for k in _EPHEMERAL_FIELDS:
+            cfg.pop(k, None)
+        dirty = True
+    if dirty:
+        _save_json_atomic(PLUGIN_CFG, cfg)
+    cfg.setdefault("cloud_service",           "dreame")
+    cfg.setdefault("username",                "")
+    cfg.setdefault("password_plain",          "")
+    cfg.setdefault("refresh_token",           "")
+    cfg.setdefault("base_topic",              "dreame")
+    cfg.setdefault("polling_interval_min",    30)
     cfg.setdefault("state_poll_interval_sec", 60)
-    cfg.setdefault("devices",               [])
+    cfg.setdefault("devices",                 [])
+    # Ephemeral — memory only, populated by the startup refresh/login below.
+    cfg["access_token"] = ""
+    cfg["expires_at"]   = 0
+    cfg["uid"]          = ""
+    cfg["uid_num"]      = ""
     return cfg
 
 
 def save_plugin_config(cfg: dict) -> None:
-    _save_json_atomic(PLUGIN_CFG, cfg)
+    on_disk = {k: v for k, v in cfg.items() if k not in _EPHEMERAL_FIELDS}
+    _save_json_atomic(PLUGIN_CFG, on_disk)
+
+
+async def publish_gateway_status(broker: dict, base_topic: str, cfg: dict) -> None:
+    """Publish auth status retained to {base_topic}/gateway.
+    Read by the WebUI (ajax.cgi) via mqtt_get — keeps the token status visible
+    even though access_token/expires_at are no longer stored on the SD card."""
+    token   = cfg.get("access_token", "")
+    payload = {
+        "state":         "running",
+        "authenticated": bool(token and cfg.get("expires_at", 0) > time.time()),
+        "expires_at":    cfg.get("expires_at", 0),
+    }
+    try:
+        async with aiomqtt.Client(**_build_mqtt_kwargs(broker)) as lbmqtt:
+            await lbmqtt.publish(f"{base_topic}/gateway", json.dumps(payload), retain=True)
+    except Exception as e:
+        LOGWARN(f"Cannot publish gateway status: {e}")
 
 
 def _is_enabled(val) -> bool:
@@ -1302,8 +1345,12 @@ async def task_token_refresh(
     brand: dict,
     cfg: dict,
     cfg_lock: asyncio.Lock,
+    broker: dict,
+    base_topic: str,
 ) -> None:
-    """Refresh access token 5 minutes before expiry; fall back to re-login on error."""
+    """Refresh access token 5 minutes before expiry; fall back to re-login on error.
+    Only writes the config to the SD card when the refresh_token actually changes —
+    access_token/expires_at/uid are ephemeral (memory only)."""
     while not _shutdown_event.is_set():
         await asyncio.sleep(30)
         now        = time.time()
@@ -1313,19 +1360,23 @@ async def task_token_refresh(
         LOGINF("Token expiring — refreshing")
         async with cfg_lock:
             try:
-                tokens = await dreame_refresh_token(session, brand, cfg["refresh_token"])
+                old_refresh          = cfg.get("refresh_token", "")
+                tokens               = await dreame_refresh_token(session, brand, old_refresh)
                 cfg["access_token"]  = tokens["access_token"]
                 cfg["refresh_token"] = tokens["refresh_token"]
                 cfg["uid_num"]       = tokens.get("uid_num", "")
                 cfg["expires_at"]    = time.time() + tokens["expires_in"]
-                save_plugin_config(cfg)
-                LOGOK("Token refreshed successfully")
+                if cfg["refresh_token"] != old_refresh:
+                    save_plugin_config(cfg)
+                    LOGOK("Token refreshed — new refresh_token persisted")
+                else:
+                    LOGOK("Token refreshed (memory only)")
             except Exception as e:
                 LOGERR(f"Token refresh failed ({e}) — attempting re-login")
                 try:
                     tokens = await dreame_login(
                         session, brand, cfg["username"],
-                        cfg.get("_password_plain", "")
+                        cfg.get("password_plain", "")
                     )
                     cfg["access_token"]  = tokens["access_token"]
                     cfg["refresh_token"] = tokens["refresh_token"]
@@ -1336,6 +1387,7 @@ async def task_token_refresh(
                     LOGOK("Re-login successful")
                 except Exception as e2:
                     LOGERR(f"Re-login failed: {e2}")
+        await publish_gateway_status(broker, base_topic, cfg)
 
 
 async def task_statistic_poll(
@@ -1397,13 +1449,31 @@ async def _async_main() -> None:
         connector=connector,
         headers={"Accept-Encoding": "gzip, deflate"},
     ) as session:
-        # Token check / login
-        if not cfg.get("access_token") or time.time() >= cfg.get("expires_at", 0) - 60:
-            LOGINF("No valid token — logging in")
-            password_plain = cfg.get("_password_plain", "")
+        # Obtain a fresh access token. access_token/expires_at/uid are ephemeral
+        # (always empty after load), so authenticate on every start. Prefer the
+        # refresh_token; only fall back to a full password login if that fails.
+        authed = False
+        if cfg.get("refresh_token"):
+            try:
+                old_refresh          = cfg["refresh_token"]
+                tokens               = await dreame_refresh_token(session, brand, old_refresh)
+                cfg["access_token"]  = tokens["access_token"]
+                cfg["refresh_token"] = tokens["refresh_token"]
+                cfg["uid"]           = tokens.get("uid", "")
+                cfg["uid_num"]       = tokens.get("uid_num", "")
+                cfg["expires_at"]    = time.time() + tokens["expires_in"]
+                if cfg["refresh_token"] != old_refresh:
+                    save_plugin_config(cfg)
+                authed = True
+                LOGOK("Authenticated via refresh_token")
+            except Exception as e:
+                LOGWARN(f"Startup token refresh failed ({e}) — trying password login")
+        if not authed:
+            password_plain = cfg.get("password_plain", "")
             if not password_plain:
                 LOGERR("No password in config — please log in via WebUI")
                 return
+            LOGINF("Logging in with username/password")
             tokens = await dreame_login(session, brand, cfg["username"], password_plain)
             cfg["access_token"]  = tokens["access_token"]
             cfg["refresh_token"] = tokens["refresh_token"]
@@ -1411,13 +1481,19 @@ async def _async_main() -> None:
             cfg["uid_num"]       = tokens.get("uid_num", "")
             cfg["expires_at"]    = time.time() + tokens["expires_in"]
             save_plugin_config(cfg)
+            LOGOK("Login successful")
 
-        # Load device list (fall back to cached)
+        # Publish initial auth status for the WebUI
+        await publish_gateway_status(broker, cfg.get("base_topic", "dreame"), cfg)
+
+        # Load device list (fall back to cached); only persist if it changed
         devices = cfg.get("devices", [])
         try:
-            devices = await get_device_list(session, brand, cfg["access_token"])
-            cfg["devices"] = devices
-            save_plugin_config(cfg)
+            new_devices = await get_device_list(session, brand, cfg["access_token"])
+            if new_devices != devices:
+                cfg["devices"] = new_devices
+                save_plugin_config(cfg)
+            devices = new_devices
             LOGOK(f"{len(devices)} device(s) found")
         except Exception as e:
             LOGWARN(f"Could not load device list ({e}), using cache")
@@ -1477,7 +1553,7 @@ async def _async_main() -> None:
                 device, broker, base_topic, session, brand, cfg, pre_array_ref
             ))
 
-        tasks_coro.append(task_token_refresh(session, brand, cfg, cfg_lock))
+        tasks_coro.append(task_token_refresh(session, brand, cfg, cfg_lock, broker, base_topic))
         tasks_coro.append(task_statistic_poll(devices, session, brand, cfg, broker, base_topic))
 
         all_tasks = [asyncio.create_task(c) for c in tasks_coro]

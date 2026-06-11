@@ -1,12 +1,9 @@
 {
   "cloud_service": "dreame",
   "username": "",
-  "password_hash": "",
-  "access_token": "",
-  "refresh_token": "",
-  "expires_at": 0,
-  "uid": "",
+  "password_plain": "",
   "base_topic": "dreame",
   "polling_interval_min": 30,
+  "state_poll_interval_sec": 60,
   "devices": []
 }
