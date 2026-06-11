@@ -19,9 +19,5 @@ cp -p -v -r /tmp/$ARGV1\_upgrade/data/$ARGV3/* $ARGV5/data/plugins/$ARGV3/
 echo "<INFO> Remove temporary folders"
 rm -r /tmp/$ARGV1\_upgrade
 
-echo "<INFO> Installing/updating Python dependencies"
-pip3 install --quiet --upgrade aiohttp aiomqtt paho-mqtt cryptography
-echo "Dreame-Dependencies aktualisiert."
-
 # Exit with Status 0
 exit 0

@@ -101,10 +101,11 @@ Bei einem Plugin-Upgrade installiert LoxBerry den `config/`-Ordner neu und **üb
 LoxBerry ruft beide Skripte mit positionalen Argumenten auf: `$1` = Temp-Ordnername, `$3` = Plugin-Ordner (`dreame`), `$5` = LoxBerry-Basis (`/opt/loxberry`).
 
 - **`preupgrade.sh`** (vor dem Upgrade): stoppt das laufende Gateway, legt `/tmp/<temp>_upgrade/{config,log,data}` an und kopiert `$5/{config,log,data}/plugins/dreame/` dorthin.
-- **`postupgrade.sh`** (nach dem Upgrade): kopiert die gesicherten Dateien aus `/tmp/<temp>_upgrade/.../dreame/*` zurück nach `$5/{config,log,data}/plugins/dreame/`, löscht den Temp-Ordner und installiert/aktualisiert die Python-Deps (pip).
+- **`postupgrade.sh`** (nach dem Upgrade): kopiert die gesicherten Dateien aus `/tmp/<temp>_upgrade/.../dreame/*` zurück nach `$5/{config,log,data}/plugins/dreame/` und löscht den Temp-Ordner.
 
 ### Wichtige Details
 
-- Greift **nur beim Upgrade**, nicht beim Erst-Install — dort laufen `preroot.sh`/`postroot.sh` (pip-Install ist dort separat enthalten).
+- **Kein pip-Install in `postupgrade.sh`** — die Python-Deps werden bei jedem Install *und* Upgrade von `postroot.sh` erledigt. Nicht duplizieren.
+- Greift **nur beim Upgrade**, nicht beim Erst-Install — dort laufen `preroot.sh`/`postroot.sh`.
 - Neue Config-Keys künftiger Versionen gehen nicht verloren: `index.cgi` setzt fehlende Keys per `//=` auf Defaults.
 - Das `gateway_stopped`-Flag liegt in `config/` und wird mitgesichert → ein gestoppter Gateway bleibt auch über ein Upgrade hinweg gestoppt.
