@@ -56,6 +56,7 @@ LoxBerry verwaltet Log-Sessions in einer SQLite-Datenbank (`/opt/loxberry/log/sy
 - **Python subprocess für LOGSTART**: Falsch! Nicht von Python aus Perl LOGSTART aufrufen — immer in Perl registrieren
 - **`result.get("data", {})` bei null-Daten**: Die Cloud-API kann `{"data": null}` zurückgeben. `result.get("data", {})` gibt dann `None` zurück (weil Key existiert). Fix: `(result.get("data") or {}).get("result", [])`
 - **daemon.sh** braucht `PLUGIN_FOLDER=$(basename "$0")` — die alte Methode via `plugindatabase.dat` funktioniert nicht (Datei ist leer)
+- **Config beim Upgrade sichern** — siehe Abschnitt „Upgrade: Config/Log/Data erhalten". Ohne `pre-/postupgrade.sh` überschreibt ein Upgrade die `pluginconfig.json`.
 - **Templates MÜSSEN im Top-Level `templates/` liegen** — NICHT unter `webfrontend/templates/`. LoxBerry kopiert beim Install nur das Top-Level-`templates/` nach `$lbptemplatedir` (`/opt/loxberry/templates/plugins/dreame/`). Liegen sie woanders, liefert `read_file("$lbptemplatedir/...")` in `index.cgi` `undef` → **alle WebUI-Tabs sind leer** (nur LoxBerry-Header/Footer rendern, kein Plugin-Inhalt). Symptom tritt erst beim sauberen Git-Install auf, nicht im Dev-Setup mit manuell platzierten Dateien.
 
 ## Gateway-Handling (Start / Restart / Stop)
@@ -90,3 +91,20 @@ Das Plugin läuft auf LoxBerry (Linux). Alle Textdateien **müssen LF** behalten
 - `.gitattributes` erzwingt `* text=auto eol=lf` → im Repo **und** im Checkout immer LF, unabhängig vom Editier-OS.
 - Die Warnung `LF will be replaced by CRLF the next time Git touches it` ist damit erledigt.
 - Nach Änderungen an `.gitattributes` einmal `git add --renormalize .` ausführen, damit bereits getrackte Dateien angeglichen werden.
+
+## Upgrade: Config/Log/Data erhalten (`preupgrade.sh` / `postupgrade.sh`)
+
+Bei einem Plugin-Upgrade installiert LoxBerry den `config/`-Ordner neu und **überschreibt damit `pluginconfig.json`** (inkl. Tokens, gespeichertem Login, `gateway_stopped`-Flag). Lösung wie beim Navimow-Plugin: sichern vor dem Upgrade, zurückspielen danach.
+
+### Ablauf
+
+LoxBerry ruft beide Skripte mit positionalen Argumenten auf: `$1` = Temp-Ordnername, `$3` = Plugin-Ordner (`dreame`), `$5` = LoxBerry-Basis (`/opt/loxberry`).
+
+- **`preupgrade.sh`** (vor dem Upgrade): stoppt das laufende Gateway, legt `/tmp/<temp>_upgrade/{config,log,data}` an und kopiert `$5/{config,log,data}/plugins/dreame/` dorthin.
+- **`postupgrade.sh`** (nach dem Upgrade): kopiert die gesicherten Dateien aus `/tmp/<temp>_upgrade/.../dreame/*` zurück nach `$5/{config,log,data}/plugins/dreame/`, löscht den Temp-Ordner und installiert/aktualisiert die Python-Deps (pip).
+
+### Wichtige Details
+
+- Greift **nur beim Upgrade**, nicht beim Erst-Install — dort laufen `preroot.sh`/`postroot.sh` (pip-Install ist dort separat enthalten).
+- Neue Config-Keys künftiger Versionen gehen nicht verloren: `index.cgi` setzt fehlende Keys per `//=` auf Defaults.
+- Das `gateway_stopped`-Flag liegt in `config/` und wird mitgesichert → ein gestoppter Gateway bleibt auch über ein Upgrade hinweg gestoppt.
