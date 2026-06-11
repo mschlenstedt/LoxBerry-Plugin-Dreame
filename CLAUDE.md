@@ -56,6 +56,7 @@ LoxBerry verwaltet Log-Sessions in einer SQLite-Datenbank (`/opt/loxberry/log/sy
 - **Python subprocess für LOGSTART**: Falsch! Nicht von Python aus Perl LOGSTART aufrufen — immer in Perl registrieren
 - **`result.get("data", {})` bei null-Daten**: Die Cloud-API kann `{"data": null}` zurückgeben. `result.get("data", {})` gibt dann `None` zurück (weil Key existiert). Fix: `(result.get("data") or {}).get("result", [])`
 - **daemon.sh** braucht `PLUGIN_FOLDER=$(basename "$0")` — die alte Methode via `plugindatabase.dat` funktioniert nicht (Datei ist leer)
+- **Templates MÜSSEN im Top-Level `templates/` liegen** — NICHT unter `webfrontend/templates/`. LoxBerry kopiert beim Install nur das Top-Level-`templates/` nach `$lbptemplatedir` (`/opt/loxberry/templates/plugins/dreame/`). Liegen sie woanders, liefert `read_file("$lbptemplatedir/...")` in `index.cgi` `undef` → **alle WebUI-Tabs sind leer** (nur LoxBerry-Header/Footer rendern, kein Plugin-Inhalt). Symptom tritt erst beim sauberen Git-Install auf, nicht im Dev-Setup mit manuell platzierten Dateien.
 
 ## Gateway-Handling (Start / Restart / Stop)
 
