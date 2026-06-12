@@ -688,6 +688,52 @@ async def send_mower_command(
 
 _GET_PROPS_CHUNK = 50
 
+async def _get_props_batch(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    did: str,
+    chunk: list,
+) -> "dict | None":
+    """One get_properties request for a chunk → {(siid, piid): value}, or None if the
+    cloud gave no usable envelope. Transport errors propagate (handled by the caller)."""
+    params = [{"did": did, "siid": s, "piid": p} for s, p in chunk]
+    result = await send_command(session, brand, access_token, did, "get_properties", params)
+    if result is None:
+        return None
+    out = {}
+    for item in (result.get("data") or {}).get("result", []):
+        siid = item.get("siid")
+        piid = item.get("piid")
+        if siid is not None and piid is not None and "value" in item:
+            out[(siid, piid)] = item["value"]
+    return out
+
+
+async def _get_props_resilient(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    did: str,
+    chunk: list,
+) -> dict:
+    """Fetch a chunk, isolating 'poison' properties. Some props (e.g. the AutoSwitch
+    composite (4,50) on Gen2 models) make the Dreame cloud return a 200-OK response
+    with an EMPTY result list for the WHOLE batch — voiding every other property in it.
+    When a ≥2-prop request comes back empty, split it and retry each half so a single
+    bad property only loses itself. A 1-prop empty result is just an unsupported prop."""
+    values = await _get_props_batch(session, brand, access_token, did, chunk)
+    if values is None:                     # no usable envelope → nothing to split
+        return {}
+    if values or len(chunk) <= 1:          # got data, or can't split further
+        return values
+    mid = len(chunk) // 2
+    left  = await _get_props_resilient(session, brand, access_token, did, chunk[:mid])
+    right = await _get_props_resilient(session, brand, access_token, did, chunk[mid:])
+    left.update(right)
+    return left
+
+
 async def get_properties(
     session: aiohttp.ClientSession,
     brand: dict,
@@ -696,19 +742,13 @@ async def get_properties(
     siid_piid_list: list,
 ) -> dict:
     """get_properties for a list of (siid, piid) pairs → {(siid, piid): value}.
-    Batches in chunks of _GET_PROPS_CHUNK to stay within cloud API limits."""
+    Batches in chunks of _GET_PROPS_CHUNK to stay within cloud API limits; a chunk
+    that comes back 200-but-empty is recursively split (_get_props_resilient) so one
+    unsupported/poison property can't void its batch-mates."""
     out = {}
     for i in range(0, len(siid_piid_list), _GET_PROPS_CHUNK):
         chunk = siid_piid_list[i:i + _GET_PROPS_CHUNK]
-        params = [{"did": did, "siid": s, "piid": p} for s, p in chunk]
-        result = await send_command(session, brand, access_token, did, "get_properties", params)
-        if result is None:
-            continue
-        for item in (result.get("data") or {}).get("result", []):
-            siid = item.get("siid")
-            piid = item.get("piid")
-            if siid is not None and piid is not None and "value" in item:
-                out[(siid, piid)] = item["value"]
+        out.update(await _get_props_resilient(session, brand, access_token, did, chunk))
     return out
 
 
@@ -1651,7 +1691,11 @@ _VACUUM_POLL_PROPS = [
     (4, 16), (4, 17), (4, 18), (4, 19), (4, 20),
     (4, 21), (4, 22), (4, 23), (4, 24), (4, 25), (4, 26), (4, 27), (4, 28), (4, 29),
     (4, 33), (4, 34), (4, 35), (4, 36), (4, 37),
-    (4, 40), (4, 41), (4, 45), (4, 46), (4, 47), (4, 48), (4, 49), (4, 50),
+    (4, 40), (4, 41), (4, 45), (4, 46), (4, 47), (4, 48), (4, 49),
+    # (4,50) AutoSwitch composite is intentionally NOT bulk-polled: on Gen2 models
+    # it voids its whole get_properties batch (battery/status would read 0). It is
+    # delivered via the realtime push path (map_properties_changed); get_properties'
+    # split-retry is the safety net should it ever sneak back into a batch.
     (4, 51), (4, 52), (4, 53), (4, 58), (4, 60), (4, 63), (4, 64), (4, 83),
     # SIID 5 – DND
     (5, 1), (5, 2), (5, 3), (5, 4),
