@@ -3,7 +3,7 @@
   "username": "",
   "password_plain": "",
   "base_topic": "dreame",
-  "statistic_poll_interval_sec": 1800,
+  "statistic_poll_interval_sec": 300,
   "state_poll_interval_sec": 60,
   "devices": []
 }

@@ -23,7 +23,7 @@ $cfg->{cloud_service}              //= 'dreame';
 $cfg->{username}                   //= '';
 $cfg->{password_plain}             //= '';
 $cfg->{base_topic}                 //= 'dreame';
-$cfg->{statistic_poll_interval_sec} //= 1800;
+$cfg->{statistic_poll_interval_sec} //= 300;
 $cfg->{state_poll_interval_sec}    //= 60;
 $cfg->{devices}                    //= [];
 
@@ -40,7 +40,7 @@ if ($action eq 'save_config') {
     $cfg->{cloud_service}               = $q->{cloud_service}        || 'dreame';
     $cfg->{username}                    = $q->{username}             || '';
     $cfg->{base_topic}                  = $q->{base_topic}           || 'dreame';
-    $cfg->{statistic_poll_interval_sec} = int($q->{statistic_poll_interval_sec} || 1800);
+    $cfg->{statistic_poll_interval_sec} = int($q->{statistic_poll_interval_sec} || 300);
     $cfg->{state_poll_interval_sec}     = int($q->{state_poll_interval_sec} || 60);
     # The password field is pre-filled, so it is sent on every save. Only act
     # when it actually changed: store the new plain password and drop the

@@ -14,6 +14,7 @@ import signal
 import ssl
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import aiohttp
@@ -391,7 +392,7 @@ def load_plugin_config() -> dict:
     cfg.setdefault("password_plain",          "")
     cfg.setdefault("refresh_token",           "")
     cfg.setdefault("base_topic",                  "dreame")
-    cfg.setdefault("statistic_poll_interval_sec", 1800)
+    cfg.setdefault("statistic_poll_interval_sec", 300)
     cfg.setdefault("state_poll_interval_sec",     60)
     cfg.setdefault("devices",                 [])
     # Ephemeral — memory only, populated by the startup refresh/login below.
@@ -950,6 +951,151 @@ async def load_statistic(
         }
 
 
+# ── Room (segment) list via map decode (B) ───────────────────────────────────
+# Ported from TA2k/ioBroker.dreame (decodeMultiMapData up to seg_inf). The map
+# string is base64url, optionally AES-CBC encrypted, then zlib-deflated. The
+# room/segment info lives in a JSON blob (`expands.seg_inf`) appended after the
+# bitmap. Whole pipeline is best-effort — any failure yields [] and is logged.
+def _map_aes_key(seed: str) -> bytes:
+    """crypto-js getAesKey: first 32 hex chars of SHA256(seed), used as UTF-8 bytes (AES-256)."""
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32].encode("utf-8")
+
+
+def _pkcs7_unpad(data: bytes) -> bytes:
+    if not data:
+        return data
+    pad = data[-1]
+    if 1 <= pad <= 16 and len(data) >= pad:
+        return data[:-pad]
+    return data
+
+
+def _b64_fix(s: str) -> str:
+    s = s.replace("-", "+").replace("_", "/")
+    return s + "=" * (-len(s) % 4)
+
+
+def _decode_map_payload(map_str: str) -> bytes:
+    """Decode a Dreame map frame string → raw inflated map bytes."""
+    if not map_str:
+        return b""
+    if "," in map_str:
+        src, seed = map_str.split(",", 1)
+        ct = base64.b64decode(_b64_fix(src))
+        cipher = Cipher(algorithms.AES(_map_aes_key(seed)), modes.CBC(b"\x00" * 16),
+                        backend=default_backend())
+        dec = cipher.decryptor()
+        buf = _pkcs7_unpad(dec.update(ct) + dec.finalize())
+    else:
+        buf = base64.b64decode(_b64_fix(map_str))
+    try:
+        return zlib.decompress(buf)
+    except zlib.error:
+        return zlib.decompress(buf, -zlib.MAX_WBITS)
+
+
+def _extract_seg_inf(raw: bytes) -> dict:
+    """Pull expands.seg_inf out of inflated map bytes (blob starts at 27 + iw*ih)."""
+    if len(raw) < 27:
+        return {}
+    iwidth  = int.from_bytes(raw[19:21], "little")
+    iheight = int.from_bytes(raw[21:23], "little")
+    start = 27 + iwidth * iheight
+    if len(raw) <= start:
+        return {}
+    try:
+        expands = json.loads(raw[start:].decode("utf-8", "ignore"))
+    except Exception:
+        return {}
+    return expands.get("seg_inf", {}) or {}
+
+
+def _rooms_from_seg_inf(seg_inf: dict) -> list:
+    """seg_inf dict → sorted [{id, name}] (name is base64-encoded inside the map)."""
+    rooms = []
+    for area_id, item in seg_inf.items():
+        try:
+            rid = int(area_id)
+        except Exception:
+            continue
+        name = ""
+        if isinstance(item, dict) and item.get("name"):
+            try:
+                name = base64.b64decode(item["name"]).decode("utf-8", "ignore")
+            except Exception:
+                name = ""
+        rooms.append({"id": rid, "name": name})
+    rooms.sort(key=lambda r: r["id"])
+    return rooms
+
+
+def _pick_map_frame(mapstr) -> str:
+    """From the downloaded 'mapstr' pick the encoded frame carrying seg_inf."""
+    if isinstance(mapstr, str):
+        return mapstr
+    frames = mapstr if isinstance(mapstr, list) else ([mapstr] if isinstance(mapstr, dict) else [])
+    chosen = None
+    for fr in frames:
+        if isinstance(fr, dict) and (fr.get("first") == 0 or fr.get("id") == 0):
+            chosen = fr
+            break
+    if chosen is None and frames and isinstance(frames[0], dict):
+        chosen = frames[0]
+    if isinstance(chosen, dict):
+        return chosen.get("map") or chosen.get("thb") or ""
+    return ""
+
+
+async def _get_map_download_url(
+    session: aiohttp.ClientSession, brand: dict, access_token: str,
+    did: str, model: str, filename: str,
+) -> "str | None":
+    """POST /dreame-user-iot/iotfile/getDownloadUrl → signed map download URL."""
+    url = f"https://{brand['domain']}/dreame-user-iot/iotfile/getDownloadUrl"
+    headers = _build_dreame_headers(brand, access_token)
+    headers["content-type"] = "application/json"
+    body = {"did": did, "model": model, "filename": filename, "region": "eu"}
+    async with session.post(url, headers=headers, json=body, ssl=False) as resp:
+        resp.raise_for_status()
+        data = await resp.json(content_type=None)
+    return data.get("data")
+
+
+async def load_rooms(
+    session: aiohttp.ClientSession, brand: dict, access_token: str,
+    did: str, model: str,
+) -> list:
+    """Fetch + decode the device map → list of {id, name} rooms (vacuum only).
+    Best-effort: returns [] on any failure. Pipeline ported from ioBroker.dreame."""
+    # 1) current map object name (siid 6, piid 8)
+    props = await get_properties(session, brand, access_token, did, [(6, 8)])
+    raw_val = props.get((6, 8))
+    object_name = ""
+    if isinstance(raw_val, dict):
+        object_name = raw_val.get("object_name", "")
+    elif isinstance(raw_val, str):
+        try:
+            object_name = json.loads(raw_val).get("object_name", "")
+        except Exception:
+            object_name = ""
+    if not object_name:
+        return []
+    # 2) signed download URL
+    file_url = await _get_map_download_url(session, brand, access_token, did, model, object_name)
+    if not file_url:
+        return []
+    # 3) download map JSON
+    async with session.get(file_url, ssl=False) as resp:
+        resp.raise_for_status()
+        content = await resp.json(content_type=None)
+    mapstr = (content or {}).get("mapstr")
+    if mapstr is None:
+        return []
+    # 4) decode → seg_inf → rooms
+    raw = _decode_map_payload(_pick_map_frame(mapstr))
+    return _rooms_from_seg_inf(_extract_seg_inf(raw))
+
+
 # ── Dreame Cloud MQTT ─────────────────────────────────────────────────────────
 
 class DreameMqttClient:
@@ -1207,6 +1353,88 @@ MOWER_PROP_SETTINGS: dict = {
 }
 
 
+# ── Room (segment) cleaning command (A + B) ──────────────────────────────────
+# Triggered via the set topic with payload 'clean_rooms:<arg>'. Two forms:
+#   • CSV  : 'clean_rooms:3,5,2'                          → rooms with live defaults
+#   • JSON : 'clean_rooms:{"rooms":[{"id":3,"suction":3}]}' → per-room overrides
+#            'clean_rooms:[[3,1,2,2,1]]'                  → raw selects passthrough
+# Cloud call is action siid=4 aiid=1 in=[{piid:1,value:18},{piid:10,value:selects}].
+_CLEAN_ROOMS_DEFAULT_REPEATS = 1   # per-command, not a device property
+_CLEAN_ROOMS_FALLBACK_SUCTION = 1  # Standard — only if the live read fails
+_CLEAN_ROOMS_FALLBACK_WATER   = 2  # Medium   — only if the live read fails
+
+
+def _parse_clean_rooms_arg(arg: str) -> list:
+    """Parse the '<arg>' of 'clean_rooms:<arg>' into [{id, repeats?, suction?, water?}, …]."""
+    arg = arg.strip()
+    if arg[:1] in ("{", "["):
+        data = json.loads(arg)
+        if isinstance(data, list):                      # raw selects array
+            return [{"_raw": item} for item in data]
+        rooms = data.get("rooms", []) if isinstance(data, dict) else []
+        out = []
+        for r in rooms:
+            if isinstance(r, dict):
+                out.append(r)
+            elif isinstance(r, (int, str)):
+                out.append({"id": int(r)})
+        return out
+    return [{"id": int(tok)} for tok in arg.split(",") if tok.strip()]
+
+
+def _build_selects_string(rooms: list, def_suction: int, def_water: int) -> str:
+    """Build the '{"selects":[[id,repeats,suction,water,order]]}' JSON string."""
+    selects, order = [], 1
+    for r in rooms:
+        if isinstance(r.get("_raw"), list):
+            selects.append(r["_raw"])
+        else:
+            selects.append([
+                int(r["id"]),
+                int(r.get("repeats", _CLEAN_ROOMS_DEFAULT_REPEATS)),
+                int(r.get("suction", def_suction)),
+                int(r.get("water",   def_water)),
+                order,
+            ])
+        order += 1
+    return json.dumps({"selects": selects}, separators=(",", ":"))
+
+
+async def _handle_clean_rooms(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    device: dict,
+    command: str,
+) -> "tuple[str, int]":
+    """Segment cleaning (vacuum only). Returns (result_str, result_num)."""
+    did = device["did"]
+    arg = command.split(":", 1)[1] if ":" in command else ""
+    rooms = _parse_clean_rooms_arg(arg)
+    if not rooms:
+        LOGWARN(f"[{did}] clean_rooms: no rooms parsed from '{arg}'")
+        return "error", 1
+    # Defaults for unset per-room values = the device's *current* suction/water,
+    # read live from the cloud (the poll tasks' props are not shared with this task).
+    def_suction, def_water = _CLEAN_ROOMS_FALLBACK_SUCTION, _CLEAN_ROOMS_FALLBACK_WATER
+    try:
+        live = await get_properties(session, brand, access_token, did, [(4, 4), (4, 5)])
+        if isinstance(live.get((4, 4)), int):
+            def_suction = live[(4, 4)]
+        if isinstance(live.get((4, 5)), int):
+            def_water = live[(4, 5)]
+    except Exception as e:
+        LOGWARN(f"[{did}] clean_rooms: live suction/water read failed ({e}) — using fallbacks")
+    selects = _build_selects_string(rooms, def_suction, def_water)
+    LOGINF(f"[{did}] clean_rooms → {selects}")
+    params = {
+        "did": did, "siid": 4, "aiid": 1,
+        "in": [{"piid": 1, "value": 18}, {"piid": 10, "value": selects}],
+    }
+    await send_command(session, brand, access_token, did, "action", params)
+    return "ok", 0
+
+
 async def handle_set_command(
     session: aiohttp.ClientSession,
     brand: dict,
@@ -1228,7 +1456,9 @@ async def handle_set_command(
             else:
                 return "error", 1
         else:
-            if command in VACUUM_ACTIONS:
+            if command == "clean_rooms" or command.startswith("clean_rooms:"):
+                return await _handle_clean_rooms(session, brand, access_token, device, command)
+            elif command in VACUUM_ACTIONS:
                 action = VACUUM_ACTIONS[command]
                 params = {**action, "did": did}
                 await send_command(session, brand, access_token, did, "action", params)
@@ -1582,8 +1812,8 @@ async def task_statistic_poll(
     broker: dict,
     base_topic: str,
 ) -> None:
-    """Poll statistics/consumables periodically (default 1800 s = 30 min)."""
-    interval = int(cfg.get("statistic_poll_interval_sec", 1800))
+    """Poll statistics/consumables (and the vacuum room list) periodically (default 300 s)."""
+    interval = int(cfg.get("statistic_poll_interval_sec", 300))
     while not _shutdown_event.is_set():
         await asyncio.sleep(interval)
         for device in devices:
@@ -1614,6 +1844,23 @@ async def task_statistic_poll(
                 LOGDEB(f"[{did}] Statistic published")
             except Exception as e:
                 LOGERR(f"[{did}] Statistic poll error: {e}")
+
+            # Room (segment) list — vacuum only, same interval, best-effort.
+            if device["device_type"] == "vacuum":
+                try:
+                    rooms = await load_rooms(
+                        session, brand, cfg["access_token"], did, device.get("model", "")
+                    )
+                    mqtt_kwargs = _build_mqtt_kwargs(broker)
+                    async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
+                        await lbmqtt.publish(
+                            f"{base_topic}/{did}/rooms",
+                            json.dumps({"rooms": rooms}),
+                            retain=True,
+                        )
+                    LOGDEB(f"[{did}] Rooms published: {len(rooms)}")
+                except Exception as e:
+                    LOGWARN(f"[{did}] Rooms fetch error: {e}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
