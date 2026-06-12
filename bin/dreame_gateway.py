@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import re
 import secrets
@@ -291,8 +292,13 @@ _logfile  = _args.logfile
 _logger = logging.getLogger("dreame_gateway")
 _logger.propagate = False
 _logger.setLevel(logging.DEBUG)
+# WatchedFileHandler (statt FileHandler): LoxBerry kann die Logdatei unter dem
+# laufenden Prozess weglöschen (z.B. wenn der Gateway-Start ins Plugin-Install-/
+# Log-Wartungs-Fenster fällt und die Log-Session verwaist). WatchedFileHandler
+# erkennt das gelöschte/ersetzte Inode und legt die Datei neu an, statt ins
+# verwaiste Inode „ins Nichts" weiterzuschreiben.
 _handler = (
-    logging.FileHandler(_logfile, mode="a", encoding="utf-8")
+    logging.handlers.WatchedFileHandler(_logfile, mode="a", encoding="utf-8")
     if _logfile else logging.StreamHandler(sys.stdout)
 )
 _handler.setFormatter(logging.Formatter(
