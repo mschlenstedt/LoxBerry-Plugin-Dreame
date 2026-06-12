@@ -286,6 +286,10 @@ GENERAL_JSON = LBSCONFIG / "general.json"
 PLUGIN_CFG   = CONFIGDIR / "pluginconfig.json"
 PID_FILE     = Path("/dev/shm/dreame_gateway.pid")
 
+# System language (LoxBerry Base.Lang from general.json); set once in _async_main.
+# Controls the language of derived room names. "de" → German, anything else → English.
+SYSTEM_LANG  = "en"
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 _loglevel = _args.loglevel
 _logfile  = _args.logfile
@@ -1016,21 +1020,52 @@ def _extract_seg_inf(raw: bytes) -> dict:
     return expands.get("seg_inf", {}) or {}
 
 
-def _rooms_from_seg_inf(seg_inf: dict) -> list:
-    """seg_inf dict → sorted [{id, name}] (name is base64-encoded inside the map)."""
+# Dreame stores a *custom* room name (base64) in seg_inf only for type 0. For
+# predefined room categories it stores just the `type` code and the app renders
+# the localized name from it. We mirror that with this table (codes per
+# Tasshack/dreame-vacuum). Codes 0–8 verified against a live German app; 9–15
+# are best-effort. Type 0 = custom → its name comes from the base64 field.
+_SEGMENT_TYPE_NAMES = {
+    "de": {
+        1: "Wohnzimmer", 2: "Schlafzimmer", 3: "Arbeitszimmer", 4: "Küche",
+        5: "Esszimmer", 6: "Bad", 7: "Balkon", 8: "Flur", 9: "Hauswirtschaftsraum",
+        10: "Ankleide", 11: "Besprechungsraum", 12: "Büro", 13: "Fitnessraum",
+        14: "Freizeitraum", 15: "Gästezimmer",
+    },
+    "en": {
+        1: "Living Room", 2: "Primary Bedroom", 3: "Study", 4: "Kitchen",
+        5: "Dining Hall", 6: "Bathroom", 7: "Balcony", 8: "Corridor", 9: "Utility Room",
+        10: "Closet", 11: "Meeting Room", 12: "Office", 13: "Fitness Area",
+        14: "Recreation Area", 15: "Secondary Bedroom",
+    },
+}
+
+
+def _rooms_from_seg_inf(seg_inf: dict, lang: "str | None" = None) -> list:
+    """seg_inf dict → sorted [{id, name, type}].
+
+    Name resolution: custom base64 `name` (type 0) → localized name from the
+    segment `type` code → generic "Raum N"/"Room N" fallback. `type` is always
+    included (None when the map carries no type for that segment)."""
+    lang = (lang or SYSTEM_LANG).lower()
+    type_names = _SEGMENT_TYPE_NAMES["de"] if lang.startswith("de") else _SEGMENT_TYPE_NAMES["en"]
+    generic = "Raum" if lang.startswith("de") else "Room"
     rooms = []
     for area_id, item in seg_inf.items():
         try:
             rid = int(area_id)
         except Exception:
             continue
+        rtype = item.get("type") if isinstance(item, dict) else None
         name = ""
         if isinstance(item, dict) and item.get("name"):
             try:
                 name = base64.b64decode(item["name"]).decode("utf-8", "ignore")
             except Exception:
                 name = ""
-        rooms.append({"id": rid, "name": name})
+        if not name:
+            name = type_names.get(rtype, f"{generic} {rid}")
+        rooms.append({"id": rid, "name": name, "type": rtype})
     rooms.sort(key=lambda r: r["id"])
     return rooms
 
@@ -1879,6 +1914,11 @@ async def _async_main() -> None:
     cfg     = load_plugin_config()
     general = _load_json(GENERAL_JSON)
     broker  = get_mqtt_broker_config(general)
+
+    # System language (Base.Lang) drives derived room names: "de" → German, else English.
+    global SYSTEM_LANG
+    SYSTEM_LANG = str((general.get("Base") or {}).get("Lang", "en")) or "en"
+    LOGINF(f"System language: {SYSTEM_LANG}")
     brand   = BRAND_CONFIG.get(cfg.get("cloud_service", "dreame"), BRAND_CONFIG["dreame"])
 
     connector = aiohttp.TCPConnector(ssl=False)
