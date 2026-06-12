@@ -130,6 +130,20 @@ if ($action eq 'getpid') {
     { open my $fh, '>', $stopped_flag }
     print encode_json({ ok => 1, msg => 'Stopped' });
 
+} elsif ($action eq 'getdevices') {
+    # Current device list from the (gateway-rewritten) config. The gateway
+    # refreshes names from the cloud on every start, so polling this after a
+    # restart lets the WebUI update device names without a full page reload.
+    my @devices = ();
+    if (ref $cfg->{devices} eq 'ARRAY') {
+        @devices = map { {
+            name  => $_->{name}  // '',
+            model => $_->{model} // '',
+            type  => (($_->{device_type} // '') eq 'mower') ? 'Mähroboter' : 'Saugroboter',
+        } } @{ $cfg->{devices} };
+    }
+    print encode_json({ devices => \@devices });
+
 } elsif ($action eq 'gettokenstatus') {
     # access_token/expires_at are ephemeral (memory only in the gateway). The
     # gateway publishes its auth status retained to {base_topic}/gateway; read

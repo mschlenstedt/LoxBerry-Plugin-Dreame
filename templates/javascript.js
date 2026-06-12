@@ -39,6 +39,54 @@ function _refreshTokenAfterRestart() {
     }, 3000);
 }
 
+// Rebuild the "Geräte" list from a devices array (built with text nodes so
+// cloud-supplied names can't inject markup).
+function _renderDevices(devices) {
+    const box = document.getElementById('devices_list');
+    if (!box) return;
+    box.textContent = '';
+    if (!devices || !devices.length) {
+        const p = document.createElement('p');
+        p.innerHTML = 'Keine Geräte &mdash; Gateway starten um Geräteliste zu laden.';
+        box.appendChild(p);
+        return;
+    }
+    const ul = document.createElement('ul');
+    ul.className = 'lb-list';
+    devices.forEach(d => {
+        const li = document.createElement('li');
+        li.appendChild(document.createTextNode((d.name || '') + ' '));
+        const sm1 = document.createElement('small');
+        sm1.textContent = '(' + (d.model || '') + ')';
+        li.appendChild(sm1);
+        li.appendChild(document.createTextNode(' — '));
+        const sm2 = document.createElement('small');
+        sm2.textContent = d.type || '';
+        li.appendChild(sm2);
+        ul.appendChild(li);
+    });
+    box.appendChild(ul);
+}
+
+function updateDevices() {
+    fetch('ajax.cgi?action=getdevices')
+        .then(r => r.json())
+        .then(data => _renderDevices(data.devices))
+        .catch(() => {});
+}
+
+// After a restart the gateway re-fetches the device list (incl. renamed
+// devices) from the cloud and rewrites the config a few seconds later — poll
+// so the names update without a reload, mirroring _refreshTokenAfterRestart().
+function _refreshDevicesAfterRestart() {
+    let attempts = 0;
+    const poll = setInterval(() => {
+        attempts++;
+        updateDevices();
+        if (attempts >= 8) clearInterval(poll);   // ~24s, poll every 3s
+    }, 3000);
+}
+
 function _pollNewPid(oldPid) {
     let attempts = 0;
     const poll = setInterval(() => {
@@ -115,6 +163,7 @@ if (btnRestart) {
                     _pollNewPid(oldPid);
                 }
                 _refreshTokenAfterRestart();
+                _refreshDevicesAfterRestart();
             })
             .catch(() => { btn.classList.remove('lb-btn-loading'); updateGatewayStatus(); });
     });
