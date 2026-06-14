@@ -503,12 +503,18 @@ def remove_pid() -> None:
     PID_FILE.unlink(missing_ok=True)
 
 
-_shutdown_event: asyncio.Event = asyncio.Event()
+# Created lazily inside the running loop in _async_main(). Must NOT be built at
+# import time: on Python 3.9 (Raspbian Bullseye) asyncio.Event() eagerly binds to
+# the loop returned by get_event_loop() at construction, which differs from the loop
+# asyncio.run() creates later — the first .wait() then raises
+# "got Future attached to a different loop". Py3.10+ binds lazily and is unaffected.
+_shutdown_event: "asyncio.Event | None" = None
 
 
 def _handle_sigterm(*_) -> None:
     LOGINF("SIGTERM received — shutting down")
-    _shutdown_event.set()
+    if _shutdown_event is not None:
+        _shutdown_event.set()
 
 
 # ── Dreame Auth ───────────────────────────────────────────────────────────────
@@ -1950,6 +1956,9 @@ async def task_statistic_poll(
 
 # ── main ──────────────────────────────────────────────────────────────────────
 async def _async_main() -> None:
+    # Build the shutdown event inside the running loop (see note at its declaration).
+    global _shutdown_event
+    _shutdown_event = asyncio.Event()
     LOGSTART("Dreame Gateway started")
     write_pid()
     signal.signal(signal.SIGTERM, _handle_sigterm)
