@@ -4,6 +4,12 @@
 
 PLUGIN_FOLDER=$(basename "$0")
 
+# LoxBerry runs plugin daemons at boot with NO argument (loxberryinit.sh:
+# "$PLUGINDAEMONS > /dev/null &"). Default the action to 'start' so the boot
+# call reaches the start case — otherwise an empty $1 falls through to *) ->
+# "Usage" -> exit 1 and the gateway never starts after a reboot.
+ACTION="${1:-start}"
+
 LBPBINDIR="${LBHOMEDIR}/bin/plugins/${PLUGIN_FOLDER}"
 LBPCONFIGDIR="${LBHOMEDIR}/config/plugins/${PLUGIN_FOLDER}"
 LBPLOGDIR="${LBHOMEDIR}/log/plugins/${PLUGIN_FOLDER}"
@@ -11,7 +17,7 @@ GATEWAY="${LBPBINDIR}/dreame_gateway.py"
 PIDFILE="/dev/shm/dreame_gateway.pid"
 STOPPED_FLAG="${LBPCONFIGDIR}/gateway_stopped"
 
-case "$1" in
+case "$ACTION" in
   start)
     # The gateway must run as the unprivileged 'loxberry' user, never as root.
     # LoxBerry calls this daemon as root at boot, so re-exec the start logic as
