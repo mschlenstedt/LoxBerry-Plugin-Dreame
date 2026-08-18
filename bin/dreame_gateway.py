@@ -110,24 +110,65 @@ def _normalize_autoswitch(value) -> dict:
 
 
 # ── State-JSON-Builder ────────────────────────────────────────────────────────
+# Status enums. Both device types report their user-facing status on (2,1) — the
+# value the manufacturer app displays. Cross-checked against Tasshack/dreame-vacuum
+# and TA2k/ioBroker.dreame, and verified against a live Mova Z60 protocol.
 _MOWER_STATUS_STR = {
-    0: "Idle", 1: "Working", 2: "Paused", 3: "Returning",
-    4: "Charging", 5: "Error", 6: "Docking",
+    1: "Working", 2: "Standby", 3: "Working", 4: "Paused",
+    5: "Returning to charge", 6: "Charging", 7: "Error",
+    8: "Raining pause", 9: "Initializing", 10: "Leaving station",
+    11: "Mapping", 12: "Border mowing", 13: "Charging completed",
+    14: "Upgrading", 15: "Relocating", 16: "Task navigating",
 }
 _VACUUM_STATUS_STR = {
-    0: "Idle", 1: "Cleaning", 2: "Returning", 3: "Charging",
-    4: "Error", 5: "Paused", 6: "Sleeping",
-    7: "Cleaning", 8: "Drying", 9: "Charging",
-    10: "On Station", 11: "Charging Complete",
-    12: "Cleaning", 13: "On Station",
-    14: "Drying", 15: "On Station",
-    16: "Washing Mop", 17: "Draining",
-    18: "Collecting Dust", 19: "Washing Mop",
+    1: "Cleaning", 2: "Standby", 3: "Paused", 4: "Paused",
+    5: "Returning to charge", 6: "Charging", 7: "Mopping",
+    8: "Mop drying", 9: "Mop washing", 10: "Returning to wash",
+    11: "Mapping", 12: "Cleaning", 13: "Charging completed",
+    14: "Upgrading", 15: "Summon to clean", 16: "Self-repairing",
+    17: "Returning to install mop pad", 18: "Returning to remove mop pad",
+    19: "Water system self-test", 20: "Cleaning mop pad and adding water",
+    21: "Cleaning paused", 22: "Auto-emptying",
+    23: "Remote controlled cleaning", 24: "Smart charging",
+    25: "Second cleaning", 26: "Following", 27: "Spot cleaning",
+    28: "Returning for dust collection", 29: "Waiting for tasks",
+    30: "Cleaning washboard base", 31: "Returning to drain",
+    32: "Draining", 33: "Water system emptying", 34: "Emptying",
+    35: "Dust bag drying", 36: "Dust bag drying paused",
+    37: "Heading to extra cleaning", 38: "Extra cleaning",
+    95: "Finding pet paused", 96: "Finding pet", 97: "Shortcut running",
+    98: "Camera monitoring", 99: "Camera monitoring paused",
+    101: "Initial deep cleaning", 102: "Initial deep cleaning paused",
+    103: "Sanitizing", 104: "Sanitizing with dry",
+    105: "Changing mop", 106: "Changing mop paused",
+    107: "Floor maintaining", 108: "Floor maintaining paused",
+}
+# (4,1) — internal cleaning task status, published alongside as task/task_str.
+_VACUUM_TASK_STR = {
+    0: "Idle", 1: "Paused", 2: "Cleaning", 3: "Back home",
+    4: "Part cleaning", 5: "Follow wall", 6: "Charging", 7: "OTA",
+    8: "FCT", 9: "WiFi set", 10: "Power off", 11: "Factory",
+    12: "Error", 13: "Remote control", 14: "Sleeping",
+    15: "Self test", 16: "Factory function test", 17: "Standby",
+    18: "Segment cleaning", 19: "Zone cleaning", 20: "Spot cleaning",
+    21: "Fast mapping", 22: "Monitor cruise", 23: "Monitor spot",
+    24: "Summon clean",
+}
+# Charging status on (3,2) — the two device types use different enums.
+_VACUUM_CHARGING_STR = {
+    1: "Charging", 2: "Not charging", 3: "Charging completed",
+    5: "Returning to charge",
+}
+_MOWER_CHARGING_STR = {0: "Not charging", 1: "Charging"}
+# Cleaning mode after unpacking, see _unpack_cleaning_mode().
+_VACUUM_CLEANING_MODE_STR = {
+    0: "Sweeping and mopping", 1: "Mopping", 2: "Sweeping",
 }
 
 
-_MOWER_NAMED: set = {(3,1),(3,2),(3,3),(3,5),(12,1),(12,2),(2,2),(2,3)}
-_VACUUM_NAMED: set = {(4,1),(3,1),(3,2),(4,3),(4,13),(4,4),(4,5),(4,23),(4,2),(4,22),(5,1),(4,27)}
+_MOWER_NAMED: set = {(2,1),(2,2),(3,1),(3,2),(4,2),(4,3),(4,7),(4,35)}
+_VACUUM_NAMED: set = {(2,1),(2,2),(3,1),(3,2),(4,1),(4,2),(4,3),(4,4),(4,5),
+                      (4,7),(4,14),(4,22),(4,23),(4,27),(4,35),(5,1)}
 _STATION_NAMED: set = {
     (25,1),(25,2),(25,3),(25,4),(25,5),           # SIID 25 – older models
     (27,1),(27,2),(27,3),(27,4),(27,5),(27,15),    # SIID 27 – newer models
@@ -148,20 +189,36 @@ _VACUUM_PROP_NAMES: dict = {
     (5, 2):  "dnd_start",               (5, 3):  "dnd_end",
     (5, 4):  "dnd_schedule",
     (7, 1):  "volume",
-    (9, 1):  "main_brush_left_pct",     (9, 2):  "main_brush_time_left_h",
-    (10, 1): "side_brush_left_pct",     (10, 2): "side_brush_time_left_h",
+    # SIID 9/10/30 carry hours on piid 1 and percent on piid 2; SIID 11/16/18/26
+    # are the other way round. The asymmetry is in the device spec, not a typo —
+    # confirmed by both references and by a live Mova Z60 protocol.
+    (9, 1):  "main_brush_time_left_h",  (9, 2):  "main_brush_left_pct",
+    (10, 1): "side_brush_time_left_h",  (10, 2): "side_brush_left_pct",
     (11, 1): "filter_left_pct",         (11, 2): "filter_time_left_h",
     (12, 1): "first_cleaning_date",     (12, 2): "total_cleaning_time_min",
     (12, 3): "cleaning_count",          (12, 4): "total_cleaned_area_m2",
     (15, 1): "auto_dust_collecting",    (15, 2): "auto_empty_frequency",
     (15, 3): "dust_collection",         (15, 5): "auto_empty_status",
     (16, 1): "sensor_dirty_left_pct",   (16, 2): "sensor_dirty_time_left_h",
+    (17, 1): "secondary_filter_left_pct",
+    (17, 2): "secondary_filter_time_left_h",
     (18, 1): "mop_pad_left_pct",        (18, 2): "mop_pad_time_left_h",
+    (26, 1): "dirty_water_tank_left_pct",
+    (26, 2): "dirty_water_tank_time_left_h",
     (28, 1): "wetness_level",           (28, 8): "water_temperature",
     (28, 27): "silent_drying",          (28, 28): "hair_compression",
-    (30, 1): "wheel_dirty_left_pct",    (30, 2): "wheel_dirty_time_left_h",
+    (30, 1): "wheel_dirty_time_left_h", (30, 2): "wheel_dirty_left_pct",
 }
 _MOWER_PROP_NAMES: dict = {
+    (2, 50): "task_info",               (2, 52): "mowing_preference",
+    (2, 55): "ai_obstacles",            (2, 56): "zone_status",
+    (2, 58): "self_check",              (2, 65): "task_type",
+    (4, 14): "serial_number",           (4, 18): "faults",
+    (4, 21): "obstacle_avoidance",      (4, 27): "child_lock",
+    (4, 42): "map_index",               (4, 43): "map_name",
+    (5, 100): "rtk_status",             (5, 106): "gps_satellites",
+    (5, 107): "positioning_mode",
+    (12, 1): "first_mow_date",          (12, 2): "total_mow_time_min",
     (12, 3): "total_mow_count",         (12, 4): "total_mow_area_m2",
 }
 
@@ -173,6 +230,21 @@ _SPEC_PROP_NAMES: dict = {}
 
 def _prop_name_map(dt: str) -> dict:
     return _MOWER_PROP_NAMES if dt == "mower" else _VACUUM_PROP_NAMES
+
+
+def _unpack_cleaning_mode(value):
+    """Gen2 devices pack the cleaning mode into the low two bits of (4,23), with
+    further settings in the upper bytes. Returns the plain mode, or None when the
+    value is not an int. Mode coding is inverted against the older single-value
+    models — 0 means sweeping *and* mopping — so the raw value is misleading on
+    both. Source: Tasshack/dreame-vacuum split_group_value().
+
+    The upper bytes are deliberately not decoded into named fields: on a live Gen2
+    device byte 1 read 25 while the explicit wetness property (28,1) read 16, so
+    they are not the same quantity. They stay available in cleaning_mode_raw."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    return value & 3 if value > 0xFF else value
 
 
 def build_state_json(device: dict, props: dict) -> dict:
@@ -188,41 +260,53 @@ def build_state_json(device: dict, props: dict) -> dict:
         "did":         device.get("did", ""),
         "online":      device.get("online", False),
     }
+    # The user-facing status lives on (2,1) for both device types, the error on (2,2).
+    status   = props.get((2, 1), 0)
+    charging = props.get((3, 2), 0)
     if dt == "mower":
-        status = props.get((3, 1), 0)
         state.update({
             "status":          status,
             "status_str":      _MOWER_STATUS_STR.get(status, "Unknown"),
-            "battery":         props.get((3, 2), 0),
-            "charging":        props.get((3, 3), 0),
-            "error":           props.get((3, 5), 0),
-            "mowing_time_min": props.get((12, 1), 0),
-            "mowing_area_m2":  props.get((12, 2), 0),
-            "task_status":     props.get((2, 2), 0),
-            "warn_status":     props.get((2, 3), 0),
+            "battery":         props.get((3, 1), 0),
+            "charging":        charging,
+            "charging_str":    _MOWER_CHARGING_STR.get(charging, "Unknown"),
+            "error":           props.get((2, 2), 0),
+            "mowing_time_min": props.get((4, 2), 0),
+            "mowing_area_m2":  props.get((4, 3), 0),
+            "task_status":     props.get((4, 7), 0),
+            "warn_status":     props.get((4, 35), 0),
         })
     else:
-        status = props.get((4, 1), 0)
+        task = props.get((4, 1), 0)
         state.update({
             "status":              status,
             "status_str":          _VACUUM_STATUS_STR.get(status, "Unknown"),
             "battery":             props.get((3, 1), 0),
-            "charging":            props.get((3, 2), 0),
-            "error":               props.get((4, 3), 0),
-            "cleaning_time_min":   props.get((4, 13), 0),
+            "charging":            charging,
+            "charging_str":        _VACUUM_CHARGING_STR.get(charging, "Unknown"),
+            "error":               props.get((2, 2), 0),
+            "task":                task,
+            "task_str":            _VACUUM_TASK_STR.get(task, "Unknown"),
+            "cleaning_time_min":   props.get((4, 2), 0),
+            "cleaned_area_m2":     props.get((4, 3), 0),
             "suction_level":       props.get((4, 4), 0),
             "water_volume":        props.get((4, 5), 0),
-            "cleaning_mode":       props.get((4, 23), 0),
-            "task_status":         props.get((4, 2), 0),
-            "warn_status":         props.get((4, 22), 0),
+            "task_status":         props.get((4, 7), 0),
+            "ai_detection":        props.get((4, 22), 0),
+            "warn_status":         props.get((4, 35), 0),
             "dnd_enabled":         props.get((5, 1), 0),
             "child_lock":          props.get((4, 27), 0),
         })
-    # cleaned_area_m2 only when (4,14) is numeric; otherwise it flows to p_4_14 below
-    if dt != "mower":
-        v_area = props.get((4, 14))
-        if isinstance(v_area, (int, float)):
-            state["cleaned_area_m2"] = v_area
+        # (4,14) is the serial number — a string on every device seen so far.
+        if (4, 14) in props:
+            state["serial_number"] = props[(4, 14)]
+        # (4,23) is a packed value on Gen2 devices; keep the raw one alongside.
+        if (4, 23) in props:
+            raw  = props[(4, 23)]
+            mode = _unpack_cleaning_mode(raw)
+            state["cleaning_mode_raw"] = raw
+            state["cleaning_mode"]     = mode if mode is not None else raw
+            state["cleaning_mode_str"] = _VACUUM_CLEANING_MODE_STR.get(mode, "Unknown")
     # Append remaining props: name them via the curated map (A) or the resolved
     # MIoT spec (B); anything still unknown — or a name collision — stays as
     # p_<siid>_<piid> so no value is lost.
@@ -1312,10 +1396,14 @@ def map_properties_changed(
         if device["device_type"] == "mower" and siid == 1 and piid == 1:
             parsed = parse_binary_state_1(value)
             if parsed:
-                current_props[(3, 2)] = parsed.get("battery",  current_props.get((3, 2), 0))
-                current_props[(3, 3)] = parsed.get("charging", current_props.get((3, 3), 0))
+                current_props[(3, 1)] = parsed.get("battery",  current_props.get((3, 1), 0))
+                current_props[(3, 2)] = parsed.get("charging", current_props.get((3, 2), 0))
+                # robot_state is the faster push path for the mower status; 0 carries
+                # no information, so never let it overwrite a polled (2,1).
+                if parsed.get("robot_state", 0):
+                    current_props[(2, 1)] = parsed["robot_state"]
                 if parsed.get("error_code", 0):
-                    current_props[(3, 5)] = parsed["error_code"]
+                    current_props[(2, 2)] = parsed["error_code"]
                 updated = True
             continue
 
@@ -1375,7 +1463,8 @@ VACUUM_ACTIONS: dict = {
 VACUUM_SETTINGS: dict = {
     "suction_level":        (4, 4),
     "water_volume":         (4, 5),
-    "cleaning_mode":        (4, 23),
+    # cleaning_mode is (4,23) but goes through _set_cleaning_mode() instead — the
+    # value is packed on Gen2 devices and needs a read-modify-write.
     "volume":               (7, 1),
     "child_lock":           (4, 27),
     "carpet_boost":         (4, 12),
@@ -1557,6 +1646,36 @@ async def handle_set_command(
         return "error", 1
 
 
+async def _set_cleaning_mode(
+    session: aiohttp.ClientSession,
+    brand: dict,
+    access_token: str,
+    did: str,
+    value,
+) -> bool:
+    """Write the cleaning mode to (4,23), preserving the upper bytes on Gen2 devices.
+    Reads the current value first: a bare write would zero the settings packed
+    alongside the mode. Returns True on success."""
+    try:
+        mode = int(value) & 3
+    except (TypeError, ValueError):
+        LOGERR(f"[{did}] cleaning_mode: '{value}' is not a number")
+        return False
+    new_value = mode
+    try:
+        current = await get_properties(session, brand, access_token, did, [(4, 23)])
+        raw = current.get((4, 23))
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0xFF:
+            new_value = (raw & ~3) | mode
+    except Exception as e:
+        # Fall back to the bare mode — better than refusing the command outright.
+        LOGWARN(f"[{did}] cleaning_mode: could not read current value ({e}), "
+                f"writing plain mode {mode}")
+    params = [{"did": did, "siid": 4, "piid": 23, "value": new_value}]
+    await send_command(session, brand, access_token, did, "set_properties", params)
+    return True
+
+
 async def handle_settings_command(
     session: aiohttp.ClientSession,
     brand: dict,
@@ -1571,7 +1690,13 @@ async def handle_settings_command(
     dt  = device["device_type"]
     try:
         if dt == "vacuum":
-            if key in VACUUM_SETTINGS:
+            if key == "cleaning_mode":
+                # (4,23) is packed on Gen2 devices — writing a bare mode there would
+                # wipe the upper bytes, so read the current value first and replace
+                # only the mode bits.
+                if not await _set_cleaning_mode(session, brand, access_token, did, value):
+                    return "error", 1
+            elif key in VACUUM_SETTINGS:
                 siid, piid = VACUUM_SETTINGS[key]
                 params = [{"did": did, "siid": siid, "piid": piid, "value": value}]
                 await send_command(session, brand, access_token, did, "set_properties", params)
@@ -1719,6 +1844,12 @@ _VACUUM_POLL_PROPS = [
     (15, 1), (15, 2), (15, 3), (15, 5),
     # SIID 16 – Sensor
     (16, 1), (16, 2),
+    # SIID 17 – Secondary filter
+    (17, 1), (17, 2),
+    # SIID 18 – Mop pad
+    (18, 1), (18, 2),
+    # SIID 26 – Dirty water tank
+    (26, 1), (26, 2),
     # SIID 25 – Station status (older models)
     (25, 1), (25, 2), (25, 3), (25, 4), (25, 5),
     # SIID 27 – Station status (newer models)
@@ -1731,8 +1862,17 @@ _VACUUM_POLL_PROPS = [
     (30, 1), (30, 2),
 ]
 _MOWER_POLL_PROPS = [
-    (3, 1), (3, 2), (3, 3), (3, 5),
-    (12, 1), (12, 2), (2, 2), (2, 3),
+    # SIID 2 – Mower Service: status (2,1) is the value the app displays
+    (2, 1), (2, 2), (2, 50), (2, 52), (2, 55), (2, 56), (2, 58), (2, 65),
+    # SIID 3 – Battery
+    (3, 1), (3, 2),
+    # SIID 4 – Mower Extend: runtime, area, task and warning status
+    (4, 2), (4, 3), (4, 7), (4, 14), (4, 18), (4, 21), (4, 27), (4, 35),
+    (4, 42), (4, 43),
+    # SIID 5 – Positioning
+    (5, 100), (5, 106), (5, 107),
+    # SIID 12 – Statistics
+    (12, 1), (12, 2), (12, 3), (12, 4),
 ]
 
 
