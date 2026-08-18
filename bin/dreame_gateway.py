@@ -160,9 +160,14 @@ _VACUUM_CHARGING_STR = {
     5: "Returning to charge",
 }
 _MOWER_CHARGING_STR = {0: "Not charging", 1: "Charging"}
-# Cleaning mode after unpacking, see _unpack_cleaning_mode().
-_VACUUM_CLEANING_MODE_STR = {
+# Cleaning mode, see _unpack_cleaning_mode(). Devices that lift their mop pad use
+# the inverted coding; plain devices use the straight one.
+_VACUUM_MODE_LIFTING_STR = {
     0: "Sweeping and mopping", 1: "Mopping", 2: "Sweeping",
+}
+_VACUUM_MODE_PLAIN_STR = {
+    0: "Sweeping", 1: "Mopping", 2: "Sweeping and mopping",
+    3: "Mopping after sweeping",
 }
 
 
@@ -232,19 +237,37 @@ def _prop_name_map(dt: str) -> dict:
     return _MOWER_PROP_NAMES if dt == "mower" else _VACUUM_PROP_NAMES
 
 
-def _unpack_cleaning_mode(value):
-    """Gen2 devices pack the cleaning mode into the low two bits of (4,23), with
-    further settings in the upper bytes. Returns the plain mode, or None when the
-    value is not an int. Mode coding is inverted against the older single-value
-    models — 0 means sweeping *and* mopping — so the raw value is misleading on
-    both. Source: Tasshack/dreame-vacuum split_group_value().
+def _has_mop_pad_lifting(props: dict, model: str) -> bool:
+    """Whether the device lifts its mop pad. Decides how (4,23) is encoded.
+    Derived exactly as Tasshack/dreame-vacuum does: a self-wash base (4,25) plus an
+    auto-empty base (15,3), with the r2216 series as a hardcoded exception."""
+    self_wash  = (4, 25) in props
+    auto_empty = (15, 3) in props
+    return (self_wash and auto_empty) or "r2216" in (model or "")
+
+
+def _unpack_cleaning_mode(value, props: dict, model: str):
+    """Decode (4,23) into a plain cleaning mode and its label.
+    Returns (mode, label). Devices that lift their mop pad pack the mode into the
+    low two bits and invert its meaning — 0 is sweeping *and* mopping there, while
+    on a plain device 0 is sweeping only. Publishing the raw value is therefore
+    misleading on both. Source: Tasshack/dreame-vacuum cleaning_mode().
 
     The upper bytes are deliberately not decoded into named fields: on a live Gen2
     device byte 1 read 25 while the explicit wetness property (28,1) read 16, so
     they are not the same quantity. They stay available in cleaning_mode_raw."""
     if not isinstance(value, int) or isinstance(value, bool):
-        return None
-    return value & 3 if value > 0xFF else value
+        return None, "Unknown"
+    lifting = _has_mop_pad_lifting(props, model)
+    mode    = (value & 3) if lifting else (value & 1 if value > 0xFF else value)
+    if lifting:
+        label = _VACUUM_MODE_LIFTING_STR.get(mode, "Unknown")
+    elif (4, 25) in props:
+        # Self-wash base without pad lifting: only "mopping" has its own code.
+        label = "Mopping" if mode == 1 else "Sweeping and mopping"
+    else:
+        label = _VACUUM_MODE_PLAIN_STR.get(mode, "Unknown")
+    return mode, label
 
 
 def build_state_json(device: dict, props: dict) -> dict:
@@ -302,11 +325,11 @@ def build_state_json(device: dict, props: dict) -> dict:
             state["serial_number"] = props[(4, 14)]
         # (4,23) is a packed value on Gen2 devices; keep the raw one alongside.
         if (4, 23) in props:
-            raw  = props[(4, 23)]
-            mode = _unpack_cleaning_mode(raw)
+            raw = props[(4, 23)]
+            mode, mode_str = _unpack_cleaning_mode(raw, props, device.get("model", ""))
             state["cleaning_mode_raw"] = raw
             state["cleaning_mode"]     = mode if mode is not None else raw
-            state["cleaning_mode_str"] = _VACUUM_CLEANING_MODE_STR.get(mode, "Unknown")
+            state["cleaning_mode_str"] = mode_str
     # Append remaining props: name them via the curated map (A) or the resolved
     # MIoT spec (B); anything still unknown — or a name collision — stays as
     # p_<siid>_<piid> so no value is lost.
@@ -1652,25 +1675,34 @@ async def _set_cleaning_mode(
     access_token: str,
     did: str,
     value,
+    model: str,
 ) -> bool:
-    """Write the cleaning mode to (4,23), preserving the upper bytes on Gen2 devices.
-    Reads the current value first: a bare write would zero the settings packed
-    alongside the mode. Returns True on success."""
+    """Write the cleaning mode to (4,23), preserving the packed upper bytes.
+    Reads the current value plus the two capability properties first: a bare write
+    would zero the settings packed alongside the mode, and how wide the mode field
+    is depends on whether the device lifts its mop pad. The value is the same plain
+    mode that build_state_json publishes as cleaning_mode, so reading and writing
+    stay symmetric. Returns True on success."""
     try:
-        mode = int(value) & 3
+        requested = int(value)
     except (TypeError, ValueError):
         LOGERR(f"[{did}] cleaning_mode: '{value}' is not a number")
         return False
-    new_value = mode
+    mask, raw = 1, None
     try:
-        current = await get_properties(session, brand, access_token, did, [(4, 23)])
-        raw = current.get((4, 23))
-        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0xFF:
-            new_value = (raw & ~3) | mode
+        current = await get_properties(
+            session, brand, access_token, did, [(4, 23), (4, 25), (15, 3)]
+        )
+        mask = 3 if _has_mop_pad_lifting(current, model) else 1
+        raw  = current.get((4, 23))
     except Exception as e:
         # Fall back to the bare mode — better than refusing the command outright.
         LOGWARN(f"[{did}] cleaning_mode: could not read current value ({e}), "
-                f"writing plain mode {mode}")
+                f"writing plain mode {requested}")
+    mode      = requested & mask
+    new_value = mode
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0xFF:
+        new_value = (raw & ~mask) | mode
     params = [{"did": did, "siid": 4, "piid": 23, "value": new_value}]
     await send_command(session, brand, access_token, did, "set_properties", params)
     return True
@@ -1694,7 +1726,8 @@ async def handle_settings_command(
                 # (4,23) is packed on Gen2 devices — writing a bare mode there would
                 # wipe the upper bytes, so read the current value first and replace
                 # only the mode bits.
-                if not await _set_cleaning_mode(session, brand, access_token, did, value):
+                if not await _set_cleaning_mode(session, brand, access_token, did,
+                                                value, device.get("model", "")):
                     return "error", 1
             elif key in VACUUM_SETTINGS:
                 siid, piid = VACUUM_SETTINGS[key]
