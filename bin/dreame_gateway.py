@@ -476,7 +476,7 @@ def _save_json_atomic(path: Path, data: dict) -> None:
 # These fields live in memory only and are NEVER written to the SD card.
 # They are re-obtained at startup via token refresh / login, so persisting them
 # would only cause needless write wear (token refresh happens ~hourly).
-_EPHEMERAL_FIELDS = frozenset(("access_token", "expires_at", "uid", "uid_num"))
+_EPHEMERAL_FIELDS = frozenset(("access_token", "expires_at", "uid", "uid_num", "token_obtained_at"))
 
 
 def load_plugin_config() -> dict:
@@ -520,8 +520,26 @@ def load_plugin_config() -> dict:
     return cfg
 
 
-def save_plugin_config(cfg: dict) -> None:
-    on_disk = {k: v for k, v in cfg.items() if k not in _EPHEMERAL_FIELDS}
+def save_plugin_config(cfg: dict, keys: tuple = ("refresh_token", "devices")) -> None:
+    """Persist the gateway-owned keys (refresh_token, devices) to the SD card.
+
+    Re-reads the on-disk config and only updates `keys`. Writing back the whole
+    in-memory copy (loaded at startup) would silently undo settings changed in
+    the WebUI while the gateway runs. If the WebUI changed the account
+    credentials in the meantime (index.cgi then clears refresh_token to force a
+    fresh login), the token belongs to the old login and is not written."""
+    on_disk = _load_json(PLUGIN_CFG)
+    if not on_disk:
+        on_disk = {k: v for k, v in cfg.items() if k not in _EPHEMERAL_FIELDS}
+    creds_changed = any(
+        on_disk.get(k, cfg.get(k)) != cfg.get(k) for k in ("username", "password_plain")
+    )
+    for k in keys:
+        if k == "refresh_token" and creds_changed:
+            LOGWARN("Credentials were changed in the WebUI — not persisting the "
+                    "refresh_token of the old login (restart the gateway to log in again)")
+            continue
+        on_disk[k] = cfg.get(k)
     _save_json_atomic(PLUGIN_CFG, on_disk)
 
 
@@ -650,6 +668,71 @@ def _build_dreame_headers(brand: dict, access_token: "str | None" = None) -> dic
     return headers
 
 
+# Set when the cloud rejects the access token (HTTP 401) or on SIGUSR1. Wakes
+# task_token_refresh so it renews the token right away instead of waiting for
+# the scheduled refresh shortly before expires_at. Created inside the running
+# loop in _async_main() (same Python 3.9 reason as _shutdown_event).
+_token_refresh_requested: "asyncio.Event | None" = None
+
+
+class DreameAuthError(Exception):
+    """The Dreame cloud rejected the access token (HTTP 401)."""
+
+
+class DreameLoginRejected(RuntimeError):
+    """/oauth/token answered 4xx: refresh token or credentials not accepted.
+    (Network errors and 5xx raise other exceptions — those are retried later
+    and do NOT trigger a fallback password login.)"""
+
+
+def _raise_for_auth(resp: aiohttp.ClientResponse) -> None:
+    """Call before raise_for_status() on every authenticated cloud request.
+    The cloud answers an invalid/expired access token with HTTP 401
+    {"code":401,"message":"Token invalid or expired"}: request an immediate
+    token refresh and raise, so the calling task fails this round only."""
+    if resp.status == 401:
+        if _token_refresh_requested is not None:
+            _token_refresh_requested.set()
+        raise DreameAuthError("HTTP 401 Token invalid or expired — token refresh requested")
+
+
+def _auth_error_text(status: int, body) -> str:
+    """Short, secret-free description of a failed /oauth/token response."""
+    if isinstance(body, dict):
+        parts = [str(body[k]) for k in ("error", "error_description", "code", "msg", "message")
+                 if body.get(k) not in (None, "")]
+        if parts:
+            return f"HTTP {status}: " + " / ".join(parts)
+    return f"HTTP {status}"
+
+
+_AUTH_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+
+async def _post_oauth_token(session: aiohttp.ClientSession, brand: dict, data: dict) -> dict:
+    """POST /dreame-auth/oauth/token; return the JSON body or raise RuntimeError
+    with the cloud's error text (e.g. 'invalid_token / Invalid refresh token
+    (expired)'). Error messages never contain token values."""
+    headers = _build_dreame_headers(brand)
+    headers["content-type"] = "application/x-www-form-urlencoded"
+    url = f"https://{brand['domain']}/dreame-auth/oauth/token"
+    async with session.post(url, headers=headers, data=data, ssl=False,
+                            timeout=_AUTH_TIMEOUT) as resp:
+        status = resp.status
+        try:
+            body = await resp.json(content_type=None)
+        except Exception as e:
+            body = f"unreadable response body ({type(e).__name__})"
+    if status != 200 or not isinstance(body, dict) or "access_token" not in body:
+        text = _auth_error_text(status, body)
+        if isinstance(body, str):
+            text += f": {body}"
+        if 400 <= status < 500:
+            raise DreameLoginRejected(text)
+        raise RuntimeError(text)
+    return body
+
+
 async def dreame_login(
     session: aiohttp.ClientSession,
     brand: dict,
@@ -657,8 +740,6 @@ async def dreame_login(
     password: str,
 ) -> dict:
     """POST /dreame-auth/oauth/token → {access_token, refresh_token, expires_in, uid}."""
-    headers = _build_dreame_headers(brand)
-    headers["content-type"] = "application/x-www-form-urlencoded"
     data = {
         "grant_type": "password",
         "scope":      "all",
@@ -669,12 +750,10 @@ async def dreame_login(
         "country":    "DE",
         "lang":       "de",
     }
-    url = f"https://{brand['domain']}/dreame-auth/oauth/token"
-    async with session.post(url, headers=headers, data=data, ssl=False) as resp:
-        resp.raise_for_status()
-        body = await resp.json(content_type=None)
-    if "access_token" not in body:
-        raise RuntimeError(f"Login failed: {body}")
+    try:
+        body = await _post_oauth_token(session, brand, data)
+    except RuntimeError as e:
+        raise type(e)(f"Login failed ({e})") from None
     jwt = _jwt_payload(body["access_token"])
     return {
         "access_token":  body["access_token"],
@@ -690,19 +769,17 @@ async def dreame_refresh_token(
     brand: dict,
     refresh_token: str,
 ) -> dict:
-    """POST /dreame-auth/oauth/token with grant_type=refresh_token."""
-    headers = _build_dreame_headers(brand)
-    headers["content-type"] = "application/x-www-form-urlencoded"
+    """POST /dreame-auth/oauth/token with grant_type=refresh_token.
+    The Dreame cloud rotates the refresh token on every refresh (the response
+    carries a new one, valid for 180 days from now); the caller must persist it."""
     data = {
         "grant_type":    "refresh_token",
         "refresh_token": refresh_token,
     }
-    url = f"https://{brand['domain']}/dreame-auth/oauth/token"
-    async with session.post(url, headers=headers, data=data, ssl=False) as resp:
-        resp.raise_for_status()
-        body = await resp.json(content_type=None)
-    if "access_token" not in body:
-        raise RuntimeError(f"Token refresh failed: {body}")
+    try:
+        body = await _post_oauth_token(session, brand, data)
+    except RuntimeError as e:
+        raise type(e)(f"Token refresh failed ({e})") from None
     jwt = _jwt_payload(body["access_token"])
     return {
         "access_token":  body["access_token"],
@@ -752,6 +829,7 @@ async def get_device_list(
         "lang": "de", "timestamp": int(time.time() * 1000),
     }
     async with session.post(url, headers=headers, json=body, ssl=False) as resp:
+        _raise_for_auth(resp)
         resp.raise_for_status()
         data = await resp.json(content_type=None)
     records = (
@@ -783,6 +861,7 @@ async def send_command(
         },
     }
     async with session.post(url, headers=headers, json=body, ssl=False) as resp:
+        _raise_for_auth(resp)
         resp.raise_for_status()
         return await resp.json(content_type=None)
 
@@ -813,6 +892,15 @@ async def _get_props_batch(
     params = [{"did": did, "siid": s, "piid": p} for s, p in chunk]
     result = await send_command(session, brand, access_token, did, "get_properties", params)
     if result is None:
+        return None
+    code = result.get("code")
+    if code not in (None, 0):
+        # Cloud-level error, not a "poisoned" batch: e.g. 80001 "device may be
+        # offline, command timed out" (answered after ~8 s). Splitting cannot
+        # help — for an offline robot it turned one poll into 211 requests
+        # (~28 min), which also blocked the whole gateway start-up.
+        LOGDEB(f"[{did}] get_properties: cloud code {code} "
+               f"({result.get('msg') or result.get('message') or ''})")
         return None
     out = {}
     for item in (result.get("data") or {}).get("result", []):
@@ -1070,6 +1158,7 @@ async def load_mower_history(
         "region": "eu",  # plugin targets EU cloud only
     }
     async with session.post(url, headers=headers, json=body, ssl=False) as resp:
+        _raise_for_auth(resp)
         resp.raise_for_status()
         data = await resp.json(content_type=None)
     return data.get("result", {}).get("records", [])
@@ -1250,6 +1339,7 @@ async def _get_map_download_url(
     headers["content-type"] = "application/json"
     body = {"did": did, "model": model, "filename": filename, "region": "eu"}
     async with session.post(url, headers=headers, json=body, ssl=False) as resp:
+        _raise_for_auth(resp)
         resp.raise_for_status()
         data = await resp.json(content_type=None)
     return data.get("data")
@@ -2018,6 +2108,57 @@ async def task_lbmqtt_to_dreame(
             await asyncio.sleep(5)
 
 
+_REFRESH_MARGIN_SEC      = 300    # renew this long before expires_at
+_REFRESH_CHECK_SEC       = 30     # expiry check interval
+_FORCED_REFRESH_MIN_AGE  = 60     # ignore 401s for a token younger than this
+_RETRY_BACKOFF_FIRST_SEC = 60     # first retry after a failed renewal …
+_RETRY_BACKOFF_MAX_SEC   = 1800   # … doubling up to this
+
+
+def _apply_tokens(cfg: dict, tokens: dict, what: str) -> bool:
+    """Store a fresh token set in cfg (memory). Returns True if the refresh_token
+    changed (the Dreame cloud rotates it on every refresh), i.e. must be persisted."""
+    old_refresh = cfg.get("refresh_token", "")
+    now = time.time()
+    cfg["access_token"]      = tokens["access_token"]
+    cfg["refresh_token"]     = tokens.get("refresh_token") or old_refresh
+    if tokens.get("uid"):
+        cfg["uid"]           = tokens["uid"]
+    if tokens.get("uid_num"):
+        cfg["uid_num"]       = tokens["uid_num"]
+    cfg["expires_at"]        = now + tokens["expires_in"]
+    cfg["token_obtained_at"] = now
+    rotated = cfg["refresh_token"] != old_refresh
+    LOGOK(
+        f"{what}: access token valid {tokens['expires_in']} s until "
+        f"{time.strftime('%H:%M:%S', time.localtime(cfg['expires_at']))}, next refresh ~"
+        f"{time.strftime('%H:%M:%S', time.localtime(cfg['expires_at'] - _REFRESH_MARGIN_SEC))}"
+        f"{' (refresh_token rotated)' if rotated else ''}"
+    )
+    return rotated
+
+
+async def renew_tokens(session: aiohttp.ClientSession, brand: dict, cfg: dict) -> None:
+    """Obtain a new access token: refresh_token grant first; password login only
+    if the cloud REJECTED the refresh token (4xx) — a network error or 5xx is
+    raised to the caller and retried later. Persists the refresh_token right away
+    whenever it changed (the cloud rotates it; the old one counts as used up)."""
+    if cfg.get("refresh_token"):
+        try:
+            tokens = await dreame_refresh_token(session, brand, cfg["refresh_token"])
+            if _apply_tokens(cfg, tokens, "Token refreshed"):
+                save_plugin_config(cfg, keys=("refresh_token",))
+            return
+        except DreameLoginRejected as e:
+            LOGWARN(f"{e} — trying password login")
+    password_plain = cfg.get("password_plain", "")
+    if not cfg.get("username") or not password_plain:
+        raise RuntimeError("no username/password in config — please log in via WebUI")
+    tokens = await dreame_login(session, brand, cfg["username"], password_plain)
+    _apply_tokens(cfg, tokens, "Password login successful")
+    save_plugin_config(cfg, keys=("refresh_token",))
+
+
 async def task_token_refresh(
     session: aiohttp.ClientSession,
     brand: dict,
@@ -2026,45 +2167,48 @@ async def task_token_refresh(
     broker: dict,
     base_topic: str,
 ) -> None:
-    """Refresh access token 5 minutes before expiry; fall back to re-login on error.
-    Only writes the config to the SD card when the refresh_token actually changes —
-    access_token/expires_at/uid are ephemeral (memory only)."""
+    """Keep the access token valid.
+    - scheduled: _REFRESH_MARGIN_SEC before expires_at,
+    - on demand: when a cloud call got HTTP 401 or on SIGUSR1
+      (_token_refresh_requested), so a token the cloud revoked early is replaced
+      within seconds instead of failing every poll until the scheduled time,
+    - on failure: retry with exponential backoff (60 s … 30 min) instead of a
+      refresh + password login every 30 s.
+    Only the refresh_token is written to the SD card (and only when it changed);
+    access_token/expires_at/uid stay in memory."""
+    failures   = 0
+    next_retry = 0.0
     while not _shutdown_event.is_set():
-        await asyncio.sleep(30)
-        now        = time.time()
-        expires_at = cfg.get("expires_at", 0)
-        if expires_at == 0 or now < expires_at - 300:
+        try:
+            await asyncio.wait_for(_token_refresh_requested.wait(), timeout=_REFRESH_CHECK_SEC)
+        except asyncio.TimeoutError:
+            pass
+        if _shutdown_event.is_set():
+            break
+        forced = _token_refresh_requested.is_set()
+        _token_refresh_requested.clear()
+        now = time.time()
+        due = now >= cfg.get("expires_at", 0) - _REFRESH_MARGIN_SEC
+        if forced and not due and now - cfg.get("token_obtained_at", 0) < _FORCED_REFRESH_MIN_AGE:
+            LOGINF("Token refresh requested, but the token is only "
+                   f"{int(now - cfg.get('token_obtained_at', 0))} s old — skipped")
             continue
-        LOGINF("Token expiring — refreshing")
+        if not (due or forced):
+            continue
+        if now < next_retry:
+            continue
+        LOGINF("Token expiring — refreshing" if due
+               else "Access token rejected (HTTP 401) or refresh requested — refreshing now")
         async with cfg_lock:
             try:
-                old_refresh          = cfg.get("refresh_token", "")
-                tokens               = await dreame_refresh_token(session, brand, old_refresh)
-                cfg["access_token"]  = tokens["access_token"]
-                cfg["refresh_token"] = tokens["refresh_token"]
-                cfg["uid_num"]       = tokens.get("uid_num", "")
-                cfg["expires_at"]    = time.time() + tokens["expires_in"]
-                if cfg["refresh_token"] != old_refresh:
-                    save_plugin_config(cfg)
-                    LOGOK("Token refreshed — new refresh_token persisted")
-                else:
-                    LOGOK("Token refreshed (memory only)")
+                await renew_tokens(session, brand, cfg)
+                failures   = 0
+                next_retry = 0.0
             except Exception as e:
-                LOGERR(f"Token refresh failed ({e}) — attempting re-login")
-                try:
-                    tokens = await dreame_login(
-                        session, brand, cfg["username"],
-                        cfg.get("password_plain", "")
-                    )
-                    cfg["access_token"]  = tokens["access_token"]
-                    cfg["refresh_token"] = tokens["refresh_token"]
-                    cfg["uid"]           = tokens["uid"]
-                    cfg["uid_num"]       = tokens.get("uid_num", "")
-                    cfg["expires_at"]    = time.time() + tokens["expires_in"]
-                    save_plugin_config(cfg)
-                    LOGOK("Re-login successful")
-                except Exception as e2:
-                    LOGERR(f"Re-login failed: {e2}")
+                failures  += 1
+                delay      = min(_RETRY_BACKOFF_FIRST_SEC * 2 ** (failures - 1), _RETRY_BACKOFF_MAX_SEC)
+                next_retry = time.time() + delay
+                LOGERR(f"Token renewal failed ({e}) — attempt {failures}, next try in {delay} s")
         await publish_gateway_status(broker, base_topic, cfg)
 
 
@@ -2130,12 +2274,19 @@ async def task_statistic_poll(
 # ── main ──────────────────────────────────────────────────────────────────────
 async def _async_main() -> None:
     # Build the shutdown event inside the running loop (see note at its declaration).
-    global _shutdown_event
-    _shutdown_event = asyncio.Event()
+    global _shutdown_event, _token_refresh_requested, _exit_code
+    _shutdown_event          = asyncio.Event()
+    _token_refresh_requested = asyncio.Event()
     LOGSTART("Dreame Gateway started")
     write_pid()
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT,  _handle_sigterm)
+    # `kill -USR1 <pid>` forces a token refresh (diagnostics; same code path as
+    # the scheduled refresh).
+    def _on_sigusr1() -> None:
+        LOGINF("SIGUSR1 received — token refresh requested")
+        _token_refresh_requested.set()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, _on_sigusr1)
 
     cfg     = load_plugin_config()
     general = _load_json(GENERAL_JSON)
@@ -2155,36 +2306,23 @@ async def _async_main() -> None:
         # Obtain a fresh access token. access_token/expires_at/uid are ephemeral
         # (always empty after load), so authenticate on every start. Prefer the
         # refresh_token; only fall back to a full password login if that fails.
-        authed = False
-        if cfg.get("refresh_token"):
-            try:
-                old_refresh          = cfg["refresh_token"]
-                tokens               = await dreame_refresh_token(session, brand, old_refresh)
-                cfg["access_token"]  = tokens["access_token"]
-                cfg["refresh_token"] = tokens["refresh_token"]
-                cfg["uid"]           = tokens.get("uid", "")
-                cfg["uid_num"]       = tokens.get("uid_num", "")
-                cfg["expires_at"]    = time.time() + tokens["expires_in"]
-                if cfg["refresh_token"] != old_refresh:
-                    save_plugin_config(cfg)
-                authed = True
-                LOGOK("Authenticated via refresh_token")
-            except Exception as e:
-                LOGWARN(f"Startup token refresh failed ({e}) — trying password login")
-        if not authed:
-            password_plain = cfg.get("password_plain", "")
-            if not password_plain:
-                LOGERR("No password in config — please log in via WebUI")
-                return
-            LOGINF("Logging in with username/password")
-            tokens = await dreame_login(session, brand, cfg["username"], password_plain)
-            cfg["access_token"]  = tokens["access_token"]
-            cfg["refresh_token"] = tokens["refresh_token"]
-            cfg["uid"]           = tokens["uid"]
-            cfg["uid_num"]       = tokens.get("uid_num", "")
-            cfg["expires_at"]    = time.time() + tokens["expires_in"]
-            save_plugin_config(cfg)
-            LOGOK("Login successful")
+        if not cfg.get("refresh_token") and not cfg.get("password_plain"):
+            LOGERR("No password in config — please log in via WebUI")
+            return
+        try:
+            await renew_tokens(session, brand, cfg)
+        except DreameLoginRejected as e:
+            # Retrying with the same credentials is pointless (and could lock
+            # the account): exit 0 so systemd does not restart us.
+            LOGERR(f"Authentication rejected: {e} — please check the login in the WebUI")
+            return
+        except Exception as e:
+            # Network/DNS not ready, cloud 5xx, ...: exit non-zero so systemd
+            # restarts the gateway after RestartSec.
+            LOGERR(f"Authentication failed: {e!r} — exiting, will be retried")
+            _exit_code = 1
+            return
+        LOGOK("Authenticated")
 
         # Publish initial auth status for the WebUI
         await publish_gateway_status(broker, cfg.get("base_topic", "dreame"), cfg)
@@ -2195,7 +2333,7 @@ async def _async_main() -> None:
             new_devices = await get_device_list(session, brand, cfg["access_token"])
             if new_devices != devices:
                 cfg["devices"] = new_devices
-                save_plugin_config(cfg)
+                save_plugin_config(cfg, keys=("devices",))
             devices = new_devices
             LOGOK(f"{len(devices)} device(s) found")
         except Exception as e:
@@ -2208,9 +2346,18 @@ async def _async_main() -> None:
         cfg_lock   = asyncio.Lock()
         base_topic = cfg.get("base_topic", "dreame")
 
+        # Start token upkeep now, not after the per-device initialisation below:
+        # that runs sequentially and can take very long (an offline robot kept
+        # it busy for ~28 min), and the token has to stay fresh meanwhile.
+        all_tasks = [asyncio.create_task(
+            task_token_refresh(session, brand, cfg, cfg_lock, broker, base_topic)
+        )]
+
         tasks_coro = []
 
         for device in devices:
+            if _shutdown_event.is_set():   # SIGTERM during start-up: stop here
+                break
             did = device["did"]
 
             # Mower: load settings at startup
@@ -2259,10 +2406,9 @@ async def _async_main() -> None:
                 device, broker, base_topic, session, brand, cfg, pre_array_ref
             ))
 
-        tasks_coro.append(task_token_refresh(session, brand, cfg, cfg_lock, broker, base_topic))
         tasks_coro.append(task_statistic_poll(devices, session, brand, cfg, broker, base_topic))
 
-        all_tasks = [asyncio.create_task(c) for c in tasks_coro]
+        all_tasks += [asyncio.create_task(c) for c in tasks_coro]
         await _shutdown_event.wait()
 
         for t in all_tasks:
@@ -2274,8 +2420,15 @@ async def _async_main() -> None:
     LOGINF("Dreame Gateway stopped")
 
 
+_exit_code = 0
+
+
 def main() -> None:
-    asyncio.run(_async_main())
+    try:
+        asyncio.run(_async_main())
+    finally:
+        remove_pid()
+    sys.exit(_exit_code)
 
 
 if __name__ == "__main__":

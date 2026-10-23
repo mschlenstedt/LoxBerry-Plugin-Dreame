@@ -19,6 +19,11 @@ my $pidfile      = '/dev/shm/dreame_gateway.pid';
 my $stopped_flag = "$lbpconfigdir/gateway_stopped";
 my $gateway      = "$lbhomedir/bin/plugins/$folder/dreame_gateway.py";
 my $lbsconf      = "$lbhomedir/config/system";
+# The gateway runs as systemd service (written by the daemon script at boot and
+# by postroot.sh). Starting it from this CGI directly would put it into
+# apache2.service's cgroup, where every Apache restart SIGKILLs it.
+my $daemon       = "$lbhomedir/system/daemons/plugins/$folder";
+my $unitfile     = "/etc/systemd/system/$folder-gateway.service";
 
 print $cgi->header(-type => 'application/json', -charset => 'utf-8');
 
@@ -42,7 +47,24 @@ if ($action eq 'getpid') {
     my $pid = read_pid();
     print encode_json({ pid => (defined $pid && pid_running($pid) ? int($pid) : undef) });
 
+} elsif ($action eq 'restart' && -f $unitfile && -x $daemon) {
+    # Normal case: (re)start the systemd service via the daemon script (uses
+    # sudo /bin/systemctl, allowed for loxberry by LoxBerry's sudoers). It also
+    # stops a gateway that was started the old way, clears the stop flag.
+    system($daemon, 'restart');
+    my $new_pid;
+    for (1..10) {
+        select(undef, undef, undef, 0.5);
+        $new_pid = read_pid();
+        last if defined $new_pid && pid_running($new_pid);
+        $new_pid = undef;
+    }
+    # The gateway writes its PID file only after Python has started; on a busy
+    # system that can take longer — the WebUI then keeps polling getpid.
+    print encode_json({ ok => 1, pid => (defined $new_pid ? $new_pid+0 : undef) });
+
 } elsif ($action eq 'restart') {
+    # Fallback (no systemd unit yet): legacy start as detached child process.
     # Stop existing instance if running
     my $pid = read_pid();
     if (defined $pid && pid_running($pid)) {
@@ -72,14 +94,14 @@ if ($action eq 'getpid') {
 
     unless (-f $gateway) {
         print encode_json({ ok => 0, error => "Gateway not found: $gateway" });
-        return;
+        exit;
     }
 
     # Double-fork to detach gateway from CGI process
     my $child = fork();
     if (!defined $child) {
         print encode_json({ ok => 0, error => "fork failed: $!" });
-        return;
+        exit;
     }
     if ($child == 0) {
         my $gc = fork();
@@ -114,13 +136,18 @@ if ($action eq 'getpid') {
         print encode_json({ ok => 0, error => 'Gateway did not start' });
     }
 
+} elsif ($action eq 'stop' && -f $unitfile && -x $daemon) {
+    # Sets the persistent stop flag, stops the service (and any legacy instance)
+    system($daemon, 'stop');
+    print encode_json({ ok => 1, msg => 'Stopped' });
+
 } elsif ($action eq 'stop') {
     my $pid = read_pid();
     unless (defined $pid && pid_running($pid)) {
         # Persist the stop even if nothing was running
         { open my $fh, '>', $stopped_flag }
         print encode_json({ ok => 1, msg => 'Not running' });
-        return;
+        exit;
     }
     kill('TERM', $pid);
     for (1..10) { sleep 1; last unless pid_running($pid); }
@@ -154,7 +181,7 @@ if ($action eq 'getpid') {
     my $raw = LoxBerry::IO::mqtt_get("$base_topic/gateway");
     if (!defined $raw || $raw eq '') {
         print encode_json({ ok => 0, has_refresh => $has_refresh, expires_in => 0 });
-        return;
+        exit;
     }
     my $data       = eval { decode_json($raw) } // {};
     my $now        = time();

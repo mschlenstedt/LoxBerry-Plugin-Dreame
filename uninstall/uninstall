@@ -1,0 +1,6 @@
+#!/bin/bash
+# Dreame Gateway: Dienst beim Deinstallieren stoppen und Unit entfernen.
+systemctl stop REPLACELBPPLUGINDIR-gateway.service >/dev/null 2>&1
+rm -f /etc/systemd/system/REPLACELBPPLUGINDIR-gateway.service
+systemctl daemon-reload
+exit 0
