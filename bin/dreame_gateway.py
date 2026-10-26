@@ -542,6 +542,26 @@ async def publish_gateway_status(broker: dict, base_topic: str, cfg: dict) -> No
         LOGWARN(f"Cannot publish gateway status: {e}")
 
 
+# Last payload of every retained device topic (state, state_station, statistic,
+# rooms), so "republish" can send them again without asking the cloud — e.g. for
+# a Miniserver that restarted, since the topics only change when the device does.
+_last_retained: dict = {}
+
+
+async def _publish_retained(lbmqtt, topic: str, payload: str) -> None:
+    _last_retained[topic] = payload
+    await lbmqtt.publish(topic, payload, retain=True)
+
+
+async def _republish(lbmqtt, base_topic: str, did: str) -> int:
+    """Publish the device's remembered topics again. Returns how many."""
+    prefix = f"{base_topic}/{did}/"
+    topics = [t for t in list(_last_retained) if t.startswith(prefix)]
+    for topic in topics:
+        await lbmqtt.publish(topic, _last_retained[topic], retain=True)
+    return len(topics)
+
+
 def _is_enabled(val) -> bool:
     return str(val).strip().lower() in ("true", "1", "yes", "on")
 
@@ -1823,18 +1843,14 @@ async def task_dreame_to_lbmqtt(
                             current_pre = mower_settings.get("_pre_array", [])
                             state = build_state_json(device, current_props)
                             state.update({k: v for k, v in mower_settings.items() if not k.startswith("_")})
-                            await lbmqtt.publish(f"{base_topic}/{did}/state", json.dumps(state), retain=True)
+                            await _publish_retained(lbmqtt, f"{base_topic}/{did}/state", json.dumps(state))
                         except Exception as e:
                             LOGERR(f"[{did}] CFG reload error: {e}")
                         continue
-                    await lbmqtt.publish(f"{base_topic}/{did}/state", json.dumps(result), retain=True)
+                    await _publish_retained(lbmqtt, f"{base_topic}/{did}/state", json.dumps(result))
                     if dt == "vacuum":
                         station = build_station_json(current_props)
-                        await lbmqtt.publish(
-                            f"{base_topic}/{did}/state_station",
-                            json.dumps(station),
-                            retain=True,
-                        )
+                        await _publish_retained(lbmqtt, f"{base_topic}/{did}/state_station", json.dumps(station))
         except aiomqtt.MqttError as e:
             if not _shutdown_event.is_set():
                 LOGWARN(f"[{did}] LoxBerry MQTT publisher disconnected: {e} — reconnect in 5s")
@@ -1943,12 +1959,10 @@ async def task_state_poll(
             if dt == "mower" and mower_settings:
                 state.update({k: v for k, v in mower_settings.items() if not k.startswith("_")})
             async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
-                await lbmqtt.publish(f"{base_topic}/{did}/state", json.dumps(state), retain=True)
+                await _publish_retained(lbmqtt, f"{base_topic}/{did}/state", json.dumps(state))
                 if dt == "vacuum":
                     station = build_station_json(current_props)
-                    await lbmqtt.publish(
-                        f"{base_topic}/{did}/state_station", json.dumps(station), retain=True
-                    )
+                    await _publish_retained(lbmqtt, f"{base_topic}/{did}/state_station", json.dumps(station))
             LOGINF(f"[{did}] State polled: {len(changed)} props changed")
         except Exception as e:
             LOGERR(f"[{did}] State poll error: {e}")
@@ -1963,27 +1977,42 @@ async def task_lbmqtt_to_dreame(
     cfg: dict,
     pre_array_ref: list,
 ) -> None:
-    """Subscribe to LoxBerry MQTT set/settings, dispatch commands to Dreame cloud."""
-    did            = device["did"]
-    set_topic      = f"{base_topic}/{did}/set"
-    settings_topic = f"{base_topic}/{did}/settings/#"
-    mqtt_kwargs    = _build_mqtt_kwargs(broker)
+    """Subscribe to LoxBerry MQTT set/settings, dispatch commands to Dreame cloud.
+    "republish" (on {base_topic}/{did}/set, or {base_topic}/gateway/set/republish
+    for all devices) sends the last values again without a cloud request."""
+    did             = device["did"]
+    set_topic       = f"{base_topic}/{did}/set"
+    settings_topic  = f"{base_topic}/{did}/settings/#"
+    republish_topic = f"{base_topic}/gateway/set/republish"
+    mqtt_kwargs     = _build_mqtt_kwargs(broker)
 
     while not _shutdown_event.is_set():
         try:
             async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
                 await lbmqtt.subscribe(set_topic)
                 await lbmqtt.subscribe(settings_topic)
-                LOGINF(f"[{did}] Subscribed: {set_topic}, {settings_topic}")
+                await lbmqtt.subscribe(republish_topic)
+                LOGINF(f"[{did}] Subscribed: {set_topic}, {settings_topic}, {republish_topic}")
                 async for msg in lbmqtt.messages:
                     if _shutdown_event.is_set():
                         break
                     topic_str   = str(msg.topic)
                     payload_str = msg.payload.decode("utf-8").strip()
+                    if topic_str == republish_topic:
+                        # every device task answers for its own topics
+                        n = await _republish(lbmqtt, base_topic, did)
+                        await publish_gateway_status(broker, base_topic, cfg)
+                        LOGINF(f"[{did}] Republished {n} topics")
+                        continue
                     result_str, result_num = "error", 1
                     command_name = ""
                     try:
-                        if topic_str == set_topic:
+                        if topic_str == set_topic and payload_str == "republish":
+                            command_name = payload_str
+                            n = await _republish(lbmqtt, base_topic, did)
+                            LOGINF(f"[{did}] Republished {n} topics")
+                            result_str, result_num = "ok", 0
+                        elif topic_str == set_topic:
                             command_name = payload_str
                             result_str, result_num = await handle_set_command(
                                 session, brand, cfg["access_token"], device, payload_str
@@ -2100,11 +2129,7 @@ async def task_statistic_poll(
                         stat["last_mow_completed"]    = last.get("completed", False)
                 mqtt_kwargs = _build_mqtt_kwargs(broker)
                 async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
-                    await lbmqtt.publish(
-                        f"{base_topic}/{did}/statistic",
-                        json.dumps(stat),
-                        retain=True,
-                    )
+                    await _publish_retained(lbmqtt, f"{base_topic}/{did}/statistic", json.dumps(stat))
                 LOGDEB(f"[{did}] Statistic published")
             except Exception as e:
                 LOGERR(f"[{did}] Statistic poll error: {e}")
@@ -2117,10 +2142,8 @@ async def task_statistic_poll(
                     )
                     mqtt_kwargs = _build_mqtt_kwargs(broker)
                     async with aiomqtt.Client(**mqtt_kwargs) as lbmqtt:
-                        await lbmqtt.publish(
-                            f"{base_topic}/{did}/rooms",
-                            json.dumps({"rooms": rooms}),
-                            retain=True,
+                        await _publish_retained(
+                            lbmqtt, f"{base_topic}/{did}/rooms", json.dumps({"rooms": rooms})
                         )
                     LOGDEB(f"[{did}] Rooms published: {len(rooms)}")
                 except Exception as e:
@@ -2242,12 +2265,10 @@ async def _async_main() -> None:
                     state = build_state_json(device, initial_props)
                     if mower_settings:
                         state.update({k: v for k, v in mower_settings.items() if not k.startswith("_")})
-                    await lbmqtt.publish(f"{base_topic}/{did}/state", json.dumps(state), retain=True)
+                    await _publish_retained(lbmqtt, f"{base_topic}/{did}/state", json.dumps(state))
                     if device["device_type"] == "vacuum":
                         station = build_station_json(initial_props)
-                        await lbmqtt.publish(
-                            f"{base_topic}/{did}/state_station", json.dumps(station), retain=True
-                        )
+                        await _publish_retained(lbmqtt, f"{base_topic}/{did}/state_station", json.dumps(station))
             except Exception as e:
                 LOGWARN(f"[{did}] Initial props error: {e}")
 
