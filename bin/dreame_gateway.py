@@ -525,14 +525,19 @@ def save_plugin_config(cfg: dict) -> None:
     _save_json_atomic(PLUGIN_CFG, on_disk)
 
 
-async def publish_gateway_status(broker: dict, base_topic: str, cfg: dict) -> None:
+async def publish_gateway_status(
+    broker: dict, base_topic: str, cfg: dict, stopping: bool = False
+) -> None:
     """Publish auth status retained to {base_topic}/gateway.
     Read by the WebUI (ajax.cgi) via mqtt_get — keeps the token status visible
-    even though access_token/expires_at are no longer stored on the SD card."""
+    even though access_token/expires_at are no longer stored on the SD card.
+    On a clean shutdown (stopping=True) authenticated is published as false.
+    There is deliberately no run-state field: without a Last Will (every publish
+    uses its own short-lived connection) a crash would leave it at "running".
+    Whether the gateway is alive is told by the keepalive (task_keepalive)."""
     token   = cfg.get("access_token", "")
     payload = {
-        "state":         "running",
-        "authenticated": bool(token and cfg.get("expires_at", 0) > time.time()),
+        "authenticated": bool(not stopping and token and cfg.get("expires_at", 0) > time.time()),
         "expires_at":    cfg.get("expires_at", 0),
     }
     try:
@@ -2068,6 +2073,31 @@ async def task_token_refresh(
         await publish_gateway_status(broker, base_topic, cfg)
 
 
+KEEPALIVE_INTERVAL_SEC = 60
+
+
+async def task_keepalive(broker: dict, base_topic: str) -> None:
+    """Publish the current epoch retained to {base_topic}/gateway/keepaliveepoch
+    every KEEPALIVE_INTERVAL_SEC, like the LoxBerry MQTT gateway does. The value
+    changes on every publish, so the MQTT gateway forwards each one; a consumer
+    (e.g. a Loxone Virtual Input with a receive timeout) detects a dead or hung
+    gateway by the updates stopping."""
+    while not _shutdown_event.is_set():
+        try:
+            async with aiomqtt.Client(**_build_mqtt_kwargs(broker)) as lbmqtt:
+                await lbmqtt.publish(
+                    f"{base_topic}/gateway/keepaliveepoch",
+                    str(int(time.time())),
+                    retain=True,
+                )
+        except Exception as e:
+            LOGWARN(f"Cannot publish keepalive: {e}")
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=KEEPALIVE_INTERVAL_SEC)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def task_statistic_poll(
     devices: list,
     session: aiohttp.ClientSession,
@@ -2261,6 +2291,7 @@ async def _async_main() -> None:
 
         tasks_coro.append(task_token_refresh(session, brand, cfg, cfg_lock, broker, base_topic))
         tasks_coro.append(task_statistic_poll(devices, session, brand, cfg, broker, base_topic))
+        tasks_coro.append(task_keepalive(broker, base_topic))
 
         all_tasks = [asyncio.create_task(c) for c in tasks_coro]
         await _shutdown_event.wait()
@@ -2268,6 +2299,7 @@ async def _async_main() -> None:
         for t in all_tasks:
             t.cancel()
         await asyncio.gather(*all_tasks, return_exceptions=True)
+        await publish_gateway_status(broker, base_topic, cfg, stopping=True)
 
     remove_pid()
     _logend()
